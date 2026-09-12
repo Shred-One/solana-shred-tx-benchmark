@@ -12,7 +12,7 @@ use serde::Deserialize;
 use shredstream::{shredstream_proxy_client::ShredstreamProxyClient, SubscribeEntriesRequest};
 use solana_hash::Hash;
 use solana_transaction::versioned::VersionedTransaction;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 type TransactionId = [u8; 64];
 
@@ -33,6 +33,8 @@ Options:
   -h, --help            Show this help
 ";
 
+const START_DELAY: Duration = Duration::from_millis(10);
+
 #[derive(Debug)]
 struct Config {
     urls: [String; 2],
@@ -50,11 +52,13 @@ struct Entry {
 }
 
 enum Event {
+    Ready(usize),
     Transaction {
         source: usize,
         id: TransactionId,
         received_at: Instant,
     },
+    Finished(usize),
     Error {
         source: usize,
         message: String,
@@ -152,6 +156,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     };
 
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let (control_sender, control_receiver) = watch::channel(None);
+    let tasks = [
+        tokio::spawn(receive(
+            0,
+            config.urls[0].clone(),
+            sender.clone(),
+            control_receiver.clone(),
+        )),
+        tokio::spawn(receive(1, config.urls[1].clone(), sender, control_receiver)),
+    ];
+    eprintln!("Waiting for both sources to become ready...");
+    if let Err(error) = wait_for_ready(&mut receiver, &config.names).await {
+        for task in tasks {
+            task.abort();
+        }
+        return Err(error.into());
+    }
+
+    let start = Instant::now() + START_DELAY;
+    let scheduled_cutoff = start + config.duration;
+    control_sender.send(Some((start, scheduled_cutoff)))?;
     eprintln!(
         "Comparing '{}' and '{}' for {} seconds. Press Ctrl+C to stop early.",
         config.names[0],
@@ -159,53 +185,78 @@ async fn main() -> Result<(), Box<dyn Error>> {
         config.duration.as_secs()
     );
 
-    let (sender, mut receiver) = mpsc::unbounded_channel();
-    let tasks = [
-        tokio::spawn(receive(0, config.urls[0].clone(), sender.clone())),
-        tokio::spawn(receive(1, config.urls[1].clone(), sender)),
-    ];
-    let started_at = Instant::now();
-    let deadline = tokio::time::sleep(config.duration);
+    let deadline = tokio::time::sleep_until(scheduled_cutoff.into());
     tokio::pin!(deadline);
     let mut stats = Stats::default();
-    let result = loop {
+    let cutoff = loop {
         tokio::select! {
-            _ = &mut deadline => break Ok(()),
+            _ = &mut deadline => break scheduled_cutoff,
             signal = tokio::signal::ctrl_c() => {
                 signal?;
-                break Ok(());
+                break Instant::now();
             }
             event = receiver.recv() => match event {
                 Some(Event::Transaction { source, id, received_at }) => {
-                    stats.observe(source, id, received_at);
+                    if received_at >= start && received_at <= scheduled_cutoff {
+                        stats.observe(source, id, received_at);
+                    }
                 }
                 Some(Event::Error { source, message }) => {
-                    break Err(MessageError(format!("{}: {message}", config.names[source])));
+                    for task in tasks {
+                        task.abort();
+                    }
+                    return Err(MessageError(format!("{}: {message}", config.names[source])).into());
                 }
-                None => break Err(MessageError("both source streams closed".to_owned())),
+                Some(Event::Ready(_) | Event::Finished(_)) => {}
+                None => return Err(MessageError("both source streams closed".to_owned()).into()),
             }
         }
     };
 
+    drop(control_sender);
+    let drain_result =
+        drain_until_finished(&mut receiver, start, cutoff, &mut stats, &config.names).await;
     for task in tasks {
         task.abort();
     }
-    result?;
-    stats.print(&config.names, started_at.elapsed());
+    drain_result?;
+    stats.print(&config.names, cutoff.saturating_duration_since(start));
     Ok(())
 }
 
-async fn receive(source: usize, url: String, sender: mpsc::UnboundedSender<Event>) {
+async fn receive(
+    source: usize,
+    url: String,
+    sender: mpsc::UnboundedSender<Event>,
+    mut control: watch::Receiver<Option<(Instant, Instant)>>,
+) {
     let mut last_error = String::new();
     for _ in 0..20 {
         match ShredstreamProxyClient::connect(url.clone()).await {
             Ok(mut client) => match client.subscribe_entries(SubscribeEntriesRequest {}).await {
                 Ok(response) => {
                     let mut stream = response.into_inner();
+                    if sender.send(Event::Ready(source)).is_err() {
+                        return;
+                    }
                     loop {
-                        match stream.message().await {
+                        tokio::select! {
+                            biased;
+                            changed = control.changed() => {
+                                if changed.is_err() {
+                                    let _ = sender.send(Event::Finished(source));
+                                    return;
+                                }
+                            }
+                            result = stream.message() => match result {
                             Ok(Some(message)) => {
                                 let received_at = Instant::now();
+                                let Some((start, cutoff)) = *control.borrow() else {
+                                    continue;
+                                };
+                                if received_at < start || received_at > cutoff {
+                                    continue;
+                                }
                                 let entries: Vec<Entry> =
                                     match bincode::deserialize(&message.entries) {
                                         Ok(entries) => entries,
@@ -248,6 +299,7 @@ async fn receive(source: usize, url: String, sender: mpsc::UnboundedSender<Event
                                 send_error(&sender, source, format!("stream error: {error}"));
                                 return;
                             }
+                            }
                         }
                     }
                 }
@@ -262,6 +314,56 @@ async fn receive(source: usize, url: String, sender: mpsc::UnboundedSender<Event
 
 fn send_error(sender: &mpsc::UnboundedSender<Event>, source: usize, message: String) {
     let _ = sender.send(Event::Error { source, message });
+}
+
+async fn wait_for_ready(
+    receiver: &mut mpsc::UnboundedReceiver<Event>,
+    names: &[String; 2],
+) -> Result<(), MessageError> {
+    let mut ready = [false; 2];
+    while !ready.iter().all(|ready| *ready) {
+        match receiver.recv().await {
+            Some(Event::Ready(source)) => ready[source] = true,
+            Some(Event::Error { source, message }) => {
+                return Err(MessageError(format!("{}: {message}", names[source])));
+            }
+            Some(Event::Transaction { .. } | Event::Finished(_)) => {}
+            None => return Err(MessageError("both source streams closed".to_owned())),
+        }
+    }
+    Ok(())
+}
+
+async fn drain_until_finished(
+    receiver: &mut mpsc::UnboundedReceiver<Event>,
+    start: Instant,
+    cutoff: Instant,
+    stats: &mut Stats,
+    names: &[String; 2],
+) -> Result<(), MessageError> {
+    let mut finished = [false; 2];
+    while !finished.iter().all(|finished| *finished) {
+        match receiver.recv().await {
+            Some(Event::Transaction {
+                source,
+                id,
+                received_at,
+            }) if received_at >= start && received_at <= cutoff => {
+                stats.observe(source, id, received_at);
+            }
+            Some(Event::Finished(source)) => finished[source] = true,
+            Some(Event::Error { source, message }) => {
+                return Err(MessageError(format!("{}: {message}", names[source])));
+            }
+            Some(Event::Ready(_) | Event::Transaction { .. }) => {}
+            None => {
+                return Err(MessageError(
+                    "source streams closed before draining".to_owned(),
+                ))
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_args(arguments: impl Iterator<Item = String>) -> Result<Option<Config>, MessageError> {
@@ -378,5 +480,69 @@ mod tests {
         assert_eq!(percentile(&[1.0, 2.0, 3.0, 4.0, 5.0], 0.50), Some(3.0));
         assert_eq!(percentile(&[1.0, 2.0, 3.0, 4.0, 5.0], 0.95), Some(5.0));
         assert_eq!(percentile(&[], 0.50), None);
+    }
+
+    #[tokio::test]
+    async fn readiness_waits_for_both_sources() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let names = ["one".to_owned(), "two".to_owned()];
+        sender.send(Event::Ready(0)).unwrap();
+
+        let waiter = tokio::spawn(async move { wait_for_ready(&mut receiver, &names).await });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        sender.send(Event::Ready(1)).unwrap();
+        assert!(waiter.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn drain_keeps_only_events_at_or_before_cutoff() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let names = ["one".to_owned(), "two".to_owned()];
+        let start = Instant::now();
+        let cutoff = start + Duration::from_millis(5);
+        sender
+            .send(Event::Transaction {
+                source: 0,
+                id: [0; 64],
+                received_at: start - Duration::from_millis(1),
+            })
+            .unwrap();
+        sender
+            .send(Event::Transaction {
+                source: 0,
+                id: [1; 64],
+                received_at: start + Duration::from_millis(1),
+            })
+            .unwrap();
+        sender.send(Event::Finished(0)).unwrap();
+        let producer = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            sender
+                .send(Event::Transaction {
+                    source: 1,
+                    id: [1; 64],
+                    received_at: start + Duration::from_millis(2),
+                })
+                .unwrap();
+            sender
+                .send(Event::Transaction {
+                    source: 1,
+                    id: [2; 64],
+                    received_at: start + Duration::from_millis(6),
+                })
+                .unwrap();
+            sender.send(Event::Finished(1)).unwrap();
+        });
+
+        let mut stats = Stats::default();
+        drain_until_finished(&mut receiver, start, cutoff, &mut stats, &names)
+            .await
+            .unwrap();
+        producer.await.unwrap();
+
+        assert_eq!(stats.unique, [1, 1]);
+        assert_eq!(stats.matched, 1);
     }
 }

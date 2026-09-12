@@ -21,7 +21,7 @@ flowchart LR
     C --> R[Comparison table]
 ```
 
-Each proxy independently reconstructs entries from its UDP stream. The benchmark timestamps decoded transactions as they arrive over local gRPC, deduplicates each source, and compares transactions observed by both sources. Transactions seen by only one source are reported separately and do not affect lead-time percentiles.
+Each proxy independently reconstructs entries from its UDP stream. The benchmark waits until both gRPC subscriptions are ready, then gives both receiver tasks the same `Instant` measurement window. At the cutoff it stops both tasks and drains every transaction timestamped inside that window before reporting. Transactions seen by only one source are reported separately and do not affect lead-time percentiles.
 
 ## Requirements
 
