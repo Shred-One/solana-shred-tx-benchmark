@@ -35,6 +35,9 @@ case "$url" in
     */solana-shred-tx-benchmark-x86_64-unknown-linux-gnu)
         tag=${url%/*}; tag=${tag##*/}
         [ "${FAIL_TAG:-}" != "$tag" ] || exit 22
+        if [ "${DELAY_TAG:-}" = "$tag" ]; then
+            sleep 2
+        fi
         printf '%s\n' '#!/bin/sh' "# VERSION: $tag" 'exit 0' >"$output"
         ;;
 esac
@@ -59,12 +62,14 @@ run_launcher() {
     LATEST_TAG=$1
     shift
     export LATEST_TAG
-    PATH="$test_dir/bin:$PATH" TMPDIR="$test_dir/tmp" "$root/start_benchmark.sh" \
+    launcher_tmp=${TEST_TMPDIR:-$test_dir/tmp}
+    PATH="$test_dir/bin:$PATH" TMPDIR="$launcher_tmp" "$root/start_benchmark.sh" \
         --source-1-address 127.0.0.1:21001 --source-1-name one \
         --source-2-address 127.0.0.1:21002 --source-2-name two --duration 1 "$@"
 }
 
-cache="$test_dir/tmp/solana-shred-tx-benchmark-cache"
+uid=$(id -u)
+cache="$test_dir/tmp/solana-shred-tx-benchmark-cache-$uid"
 metadata="$cache/benchmark-version"
 cached_tag() {
     awk '{ print $1 }' "$metadata"
@@ -109,6 +114,59 @@ fi
 binary=$(cached_binary)
 grep -q '^# VERSION: 0.1.2$' "$binary"
 
+safe_metadata=$(cat "$metadata")
+safe_directory=${safe_metadata#* }
+for unsafe_metadata in '0.1.2 ../outside' "0.1.02 $safe_directory"; do
+    printf '%s\n' "$unsafe_metadata" >"$metadata"
+    : >"$TEST_DOWNLOAD_LOG"
+    if run_launcher 0.1.3 >/dev/null 2>&1; then
+        echo 'Expected unsafe metadata to be rejected' >&2
+        exit 1
+    fi
+    [ ! -s "$TEST_DOWNLOAD_LOG" ]
+done
+printf '%s\n' "$safe_metadata" >"$metadata"
+
+security_tmp="$test_dir/security"
+mkdir -p "$security_tmp/target"
+ln -s "$security_tmp/target" "$security_tmp/solana-shred-tx-benchmark-cache-$uid"
+target_mode=$(stat -c %a "$security_tmp/target")
+if TEST_TMPDIR="$security_tmp" run_launcher 0.1.3 >/dev/null 2>&1; then
+    echo 'Expected a cache symlink to be rejected' >&2
+    exit 1
+fi
+[ "$(stat -c %a "$security_tmp/target")" = "$target_mode" ]
+
+non_directory_tmp="$test_dir/non-directory"
+mkdir -p "$non_directory_tmp"
+: >"$non_directory_tmp/solana-shred-tx-benchmark-cache-$uid"
+if TEST_TMPDIR="$non_directory_tmp" run_launcher 0.1.3 >/dev/null 2>&1; then
+    echo 'Expected a non-directory cache path to be rejected' >&2
+    exit 1
+fi
+
+binary=$(cached_binary)
+printf 'corrupt\n' >"$binary"
+: >"$TEST_DOWNLOAD_LOG"
+DELAY_TAG=0.1.2 run_launcher 0.1.2 >"$test_dir/older.log" 2>&1 &
+older_pid=$!
+attempt=0
+until grep -q '/releases/download/0.1.2/solana-shred-tx-benchmark-x86_64' "$TEST_DOWNLOAD_LOG"; do
+    if ! kill -0 "$older_pid" 2>/dev/null || [ "$attempt" -ge 40 ]; then
+        wait "$older_pid" || true
+        echo 'Older launcher did not enter its delayed download' >&2
+        exit 1
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.05
+done
+run_launcher 0.1.3 --latest-update >"$test_dir/newer.log" 2>&1 &
+newer_pid=$!
+wait "$older_pid"
+wait "$newer_pid"
+[ "$(cached_tag)" = 0.1.3 ]
+
+binary=$(cached_binary)
 cp "$binary" "$test_dir/override"
 chmod +x "$test_dir/override"
 : >"$TEST_DOWNLOAD_LOG"

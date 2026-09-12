@@ -148,7 +148,7 @@ done
     printf 'The pinned ShredStream proxy binary supports x86_64 Linux only.\n' >&2
     exit 1
 }
-for command in curl sha256sum; do
+for command in curl flock id sha256sum stat; do
     command -v "$command" >/dev/null 2>&1 || {
         printf 'Required command not found: %s\n' "$command" >&2
         exit 1
@@ -159,9 +159,36 @@ if [ -n "${SOLANA_SHRED_TX_BENCHMARK_BIN:-}" ] && [ ! -x "$SOLANA_SHRED_TX_BENCH
     exit 1
 fi
 
-cache_dir="${TMPDIR:-/tmp}/solana-shred-tx-benchmark-cache"
-mkdir -p "$cache_dir"
+cache_uid=$(id -u)
+cache_dir="${TMPDIR:-/tmp}/solana-shred-tx-benchmark-cache-$cache_uid"
+cache_dir_valid() {
+    [ ! -L "$cache_dir" ] && [ -d "$cache_dir" ] &&
+        [ "$(stat -c %u -- "$cache_dir" 2>/dev/null)" = "$cache_uid" ]
+}
+if [ ! -e "$cache_dir" ] && [ ! -L "$cache_dir" ]; then
+    old_umask=$(umask)
+    umask 077
+    mkdir "$cache_dir" 2>/dev/null || true
+    umask "$old_umask"
+fi
+if ! cache_dir_valid; then
+    printf 'Unsafe benchmark cache directory: %s\n' "$cache_dir" >&2
+    exit 1
+fi
 chmod 700 "$cache_dir"
+
+lock_file="$cache_dir/cache.lock"
+if [ ! -e "$lock_file" ] && [ ! -L "$lock_file" ]; then
+    (umask 077 && set -C && : >"$lock_file") 2>/dev/null || true
+fi
+if [ -L "$lock_file" ] || [ ! -f "$lock_file" ] ||
+    [ "$(stat -c %u -- "$lock_file" 2>/dev/null)" != "$cache_uid" ]; then
+    printf 'Unsafe benchmark cache lock: %s\n' "$lock_file" >&2
+    exit 1
+fi
+exec 9>>"$lock_file"
+flock -x 9
+
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/solana-shred-tx-benchmark.XXXXXX")
 proxy_pid_1=""
 proxy_pid_2=""
@@ -182,7 +209,7 @@ valid_release_tag() {
         0.1.*)
             release_patch=${1#0.1.}
             case "$release_patch" in
-                '' | *[!0-9]*) return 1 ;;
+                '' | *[!0-9]* | 0[0-9]*) return 1 ;;
             esac
             ;;
         *) return 1 ;;
@@ -202,10 +229,15 @@ resolve_latest_release() {
 }
 
 proxy_bin="$cache_dir/jito-shredstream-proxy-$PROXY_VERSION"
-if [ -f "$proxy_bin" ] &&
-    printf '%s  %s\n' "$PROXY_SHA256" "$proxy_bin" | sha256sum -c - >/dev/null 2>&1; then
-    printf 'Using cached Jito ShredStream proxy %s.\n' "$PROXY_VERSION"
-else
+if [ -e "$proxy_bin" ] || [ -L "$proxy_bin" ]; then
+    if [ -L "$proxy_bin" ] || [ ! -f "$proxy_bin" ] ||
+        [ "$(stat -c %u -- "$proxy_bin" 2>/dev/null)" != "$cache_uid" ]; then
+        printf 'Unsafe cached Jito ShredStream proxy: %s\n' "$proxy_bin" >&2
+        exit 1
+    fi
+fi
+if [ ! -f "$proxy_bin" ] ||
+    ! printf '%s  %s\n' "$PROXY_SHA256" "$proxy_bin" | sha256sum -c - >/dev/null 2>&1; then
     proxy_temp=$(mktemp "$cache_dir/.jito-shredstream-proxy.XXXXXX")
     printf 'Downloading Jito ShredStream proxy %s...\n' "$PROXY_VERSION"
     if ! curl -fsSL --retry 3 "$PROXY_URL" -o "$proxy_temp" ||
@@ -215,6 +247,8 @@ else
     fi
     chmod +x "$proxy_temp"
     mv -f "$proxy_temp" "$proxy_bin"
+else
+    printf 'Using cached Jito ShredStream proxy %s.\n' "$PROXY_VERSION"
 fi
 chmod +x "$proxy_bin"
 
@@ -226,6 +260,19 @@ checksum_file=""
 benchmark_cache_valid() {
     [ -f "$benchmark_bin" ] && [ -f "$checksum_file" ] &&
         (cd "$benchmark_dir" && sha256sum -c "$BENCHMARK_BINARY_NAME.sha256") >/dev/null 2>&1
+}
+
+benchmark_cache_safe() {
+    for cached_file in "$benchmark_bin" "$checksum_file"; do
+        if [ -e "$cached_file" ] || [ -L "$cached_file" ]; then
+            if [ -L "$cached_file" ] || [ ! -f "$cached_file" ] ||
+                [ "$(stat -c %u -- "$cached_file" 2>/dev/null)" != "$cache_uid" ]; then
+                printf 'Unsafe cached benchmark file: %s\n' "$cached_file" >&2
+                return 1
+            fi
+        fi
+    done
+    return 0
 }
 
 download_benchmark() {
@@ -254,23 +301,40 @@ if [ -n "${SOLANA_SHRED_TX_BENCHMARK_BIN:-}" ]; then
     benchmark_bin=$SOLANA_SHRED_TX_BENCHMARK_BIN
 else
     cached_tag=""
-    if [ -r "$metadata_file" ]; then
+    if [ -e "$metadata_file" ] || [ -L "$metadata_file" ]; then
+        if [ -L "$metadata_file" ] || [ ! -f "$metadata_file" ] ||
+            [ "$(stat -c %u -- "$metadata_file" 2>/dev/null)" != "$cache_uid" ]; then
+            printf 'Unsafe cached benchmark metadata.\n' >&2
+            exit 1
+        fi
         cached_dir=""
         extra=""
         read -r cached_tag cached_dir extra <"$metadata_file" || true
         if ! valid_release_tag "$cached_tag" || [ -n "$extra" ]; then
-            printf 'Ignoring invalid cached benchmark version: %s\n' "$cached_tag" >&2
-            cached_tag=""
+            printf 'Invalid cached benchmark version: %s\n' "$cached_tag" >&2
+            exit 1
         else
             case "$cached_dir" in
-                benchmark."$cached_tag".*)
+                *"/"* | *".."* | *[!A-Za-z0-9._-]*)
+                    printf 'Invalid cached benchmark metadata.\n' >&2
+                    exit 1
+                    ;;
+                benchmark."$cached_tag".??????)
                     benchmark_dir="$cache_dir/$cached_dir"
                     benchmark_bin="$benchmark_dir/$BENCHMARK_BINARY_NAME"
                     checksum_file="$benchmark_bin.sha256"
+                    if [ -e "$benchmark_dir" ] || [ -L "$benchmark_dir" ]; then
+                        if [ -L "$benchmark_dir" ] || [ ! -d "$benchmark_dir" ] ||
+                            [ "$(stat -c %u -- "$benchmark_dir" 2>/dev/null)" != "$cache_uid" ]; then
+                            printf 'Unsafe cached benchmark directory.\n' >&2
+                            exit 1
+                        fi
+                    fi
+                    benchmark_cache_safe || exit 1
                     ;;
                 *)
-                    printf 'Ignoring invalid cached benchmark metadata.\n' >&2
-                    cached_tag=""
+                    printf 'Invalid cached benchmark metadata.\n' >&2
+                    exit 1
                     ;;
             esac
         fi
@@ -314,6 +378,9 @@ else
     fi
     chmod +x "$benchmark_bin"
 fi
+
+flock -u 9
+exec 9>&-
 
 printf 'Starting proxy for %s on %s...\n' "$source_1_name" "$source_1_address"
 "$proxy_bin" forward-only \

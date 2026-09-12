@@ -26,7 +26,7 @@ Each proxy independently reconstructs entries from its UDP stream. The benchmark
 ## Requirements
 
 - x86_64 Linux
-- `curl` and `sha256sum`
+- `curl`, `flock`, `sha256sum`, and `stat`
 - Two local IP/UDP ports where the upstream sources send shreds
 
 Building or running directly from source additionally requires Rust and Cargo.
@@ -59,9 +59,9 @@ From a local checkout:
 ./start_benchmark.sh
 ```
 
-Use `./start_benchmark.sh --help` for all options, including custom local gRPC ports. The launcher keeps verified binaries in `${TMPDIR:-/tmp}/solana-shred-tx-benchmark-cache`; cleanup removes only runtime files and processes. The pinned Jito proxy is reused while its SHA-256 remains valid.
+Use `./start_benchmark.sh --help` for all options, including custom local gRPC ports. The launcher keeps verified binaries in `${TMPDIR:-/tmp}/solana-shred-tx-benchmark-cache-UID`; cleanup removes only runtime files and processes. It rejects cache paths with an unexpected type or owner before changing permissions or running cached files. The pinned Jito proxy is reused while its SHA-256 remains valid.
 
-On the first run, the latest benchmark release is downloaded and recorded. Later runs keep using that verified cached version and only report when a newer release is available. Pass `--latest-update` to download, verify, and switch to the newest release. A damaged cache is restored from its recorded release before update handling, and a verified download is activated by an atomic metadata update. Set `SOLANA_SHRED_TX_BENCHMARK_BIN` to an executable path to bypass benchmark release and cache handling with a specific local binary instead.
+On the first run, the latest benchmark release is downloaded and recorded. Later runs keep using that verified cached version and only report when a newer release is available. Pass `--latest-update` to download, verify, and switch to the newest release. A damaged cache is restored from its recorded release before update handling, and a verified download is activated by an atomic metadata update. Cache operations hold an inter-process lock; the operating system releases this lock automatically if a launcher exits unexpectedly. Set `SOLANA_SHRED_TX_BENCHMARK_BIN` to an executable path to bypass benchmark release and cache handling with a specific local binary instead.
 
 ## Releases
 
