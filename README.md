@@ -73,7 +73,9 @@ A failed or cancelled release run also keeps its sequence number. To preserve a 
 
 ## Output
 
-The final table contains:
+When stdout is a terminal, the benchmark updates one in-place progress line every 200 ms with elapsed time and each source's cumulative unique transaction count. Redirected output stays static. The progress line is cleared before the final fixed-width table or after Ctrl+C.
+
+The final aligned table contains:
 
 - `Unique tx`: distinct transactions decoded from that source.
 - `First`: matched transactions delivered first by that source.

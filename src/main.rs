@@ -5,6 +5,7 @@ use std::{
     env,
     error::Error,
     fmt,
+    io::{self, IsTerminal, Write},
     time::{Duration, Instant},
 };
 
@@ -34,6 +35,7 @@ Options:
 ";
 
 const START_DELAY: Duration = Duration::from_millis(10);
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
 
 #[derive(Debug)]
 struct Config {
@@ -116,19 +118,43 @@ impl Stats {
             names[1],
             self.unique[1].saturating_sub(self.matched)
         );
-        println!(
-            "| Source | Unique tx | First | Win rate | Mean lead | P50 lead | P75 lead | P95 lead | P99 lead |"
+        println!("{}", self.table(names));
+    }
+
+    fn table(&self, names: &[String; 2]) -> String {
+        let source_width = names
+            .iter()
+            .map(|name| name.chars().count())
+            .max()
+            .unwrap_or(0)
+            .max("Source".len());
+        let mut lines = vec![format!(
+            "{:<source_width$}  {:>10}  {:>10}  {:>8}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}",
+            "Source",
+            "Unique tx",
+            "First",
+            "Win rate",
+            "Mean lead",
+            "P50 lead",
+            "P75 lead",
+            "P95 lead",
+            "P99 lead"
+        )];
+        lines.push(
+            [source_width, 10, 10, 8, 10, 10, 10, 10, 10]
+                .map(|width| "-".repeat(width))
+                .join("  "),
         );
-        println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|");
         for (source, name) in names.iter().enumerate() {
             let win_rate = if self.matched == 0 {
                 0.0
             } else {
                 self.first[source] as f64 * 100.0 / self.matched as f64
             };
-            println!(
-                "| {} | {} | {} | {:.1}% | {} | {} | {} | {} | {} |",
-                name.replace('|', "\\|"),
+            let win_rate = format!("{win_rate:.1}%");
+            lines.push(format!(
+                "{:<source_width$}  {:>10}  {:>10}  {:>8}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}",
+                name,
                 self.unique[source],
                 self.first[source],
                 win_rate,
@@ -137,9 +163,63 @@ impl Stats {
                 format_milliseconds(percentile(&self.leads_ms[source], 0.75)),
                 format_milliseconds(percentile(&self.leads_ms[source], 0.95)),
                 format_milliseconds(percentile(&self.leads_ms[source], 0.99)),
-            );
+            ));
+        }
+        lines.join("\n")
+    }
+}
+
+struct ProgressLine {
+    visible: bool,
+    drawn: bool,
+}
+
+impl ProgressLine {
+    fn new(visible: bool) -> Self {
+        Self {
+            visible,
+            drawn: false,
         }
     }
+
+    fn update(
+        &mut self,
+        output: &mut impl Write,
+        names: &[String; 2],
+        elapsed: Duration,
+        unique: [u64; 2],
+    ) -> io::Result<()> {
+        if self.visible {
+            write!(
+                output,
+                "\r\x1b[2K{}",
+                format_progress(names, elapsed, unique)
+            )?;
+            output.flush()?;
+            self.drawn = true;
+        }
+        Ok(())
+    }
+
+    fn clear(&mut self, output: &mut impl Write) -> io::Result<()> {
+        if self.drawn {
+            write!(output, "\r\x1b[2K")?;
+            output.flush()?;
+            self.drawn = false;
+        }
+        Ok(())
+    }
+}
+
+fn format_progress(names: &[String; 2], elapsed: Duration, unique: [u64; 2]) -> String {
+    format!(
+        "Running {:>6.1}s | {}: {} unique tx | {}: {} unique tx",
+        elapsed.as_secs_f64(),
+        names[0],
+        unique[0],
+        names[1],
+        unique[1]
+    )
 }
 
 #[derive(Debug)]
@@ -191,6 +271,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let deadline = tokio::time::sleep_until(scheduled_cutoff.into());
     tokio::pin!(deadline);
+    let mut progress_interval = tokio::time::interval(PROGRESS_INTERVAL);
+    progress_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut progress = ProgressLine::new(io::stdout().is_terminal());
     let mut stats = Stats::default();
     let cutoff = loop {
         tokio::select! {
@@ -199,6 +282,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 signal?;
                 break Instant::now();
             }
+            _ = progress_interval.tick(), if progress.visible => {
+                progress.update(
+                    &mut io::stdout().lock(),
+                    &config.names,
+                    Instant::now().saturating_duration_since(start).min(config.duration),
+                    stats.unique,
+                )?;
+            }
             event = receiver.recv() => match event {
                 Some(Event::Transaction { source, id, received_at }) => {
                     if received_at >= start && received_at <= scheduled_cutoff {
@@ -206,16 +297,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
                 Some(Event::Error { source, message }) => {
+                    progress.clear(&mut io::stdout().lock())?;
                     for task in tasks {
                         task.abort();
                     }
                     return Err(MessageError(format!("{}: {message}", config.names[source])).into());
                 }
                 Some(Event::Ready(_) | Event::Finished(_)) => {}
-                None => return Err(MessageError("both source streams closed".to_owned()).into()),
+                None => {
+                    progress.clear(&mut io::stdout().lock())?;
+                    return Err(MessageError("both source streams closed".to_owned()).into());
+                }
             }
         }
     };
+    progress.clear(&mut io::stdout().lock())?;
 
     drop(control_sender);
     let drain_result =
@@ -498,6 +594,40 @@ mod tests {
         assert_eq!(percentile(&quartet, 0.75), Some(3.0));
         assert_eq!(percentile(&quartet, 0.95), Some(4.0));
         assert_eq!(percentile(&quartet, 0.99), Some(4.0));
+    }
+
+    #[test]
+    fn formats_fixed_width_table_and_tty_progress() {
+        assert_eq!(PROGRESS_INTERVAL, Duration::from_millis(200));
+        let names = ["one".to_owned(), "source-two".to_owned()];
+        let stats = Stats {
+            unique: [12, 3_456],
+            first: [7, 3],
+            matched: 10,
+            leads_ms: [vec![0.125], vec![12.5]],
+            ..Stats::default()
+        };
+        let table = stats.table(&names);
+        let widths = table.lines().map(str::len).collect::<Vec<_>>();
+        assert!(widths.iter().all(|width| *width == widths[0]));
+        assert!(!table.contains('|'));
+
+        let mut output = Vec::new();
+        let mut hidden = ProgressLine::new(false);
+        hidden
+            .update(&mut output, &names, Duration::from_millis(1200), [12, 34])
+            .unwrap();
+        assert!(output.is_empty());
+
+        let mut visible = ProgressLine::new(true);
+        visible
+            .update(&mut output, &names, Duration::from_millis(1200), [12, 34])
+            .unwrap();
+        visible.clear(&mut output).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "\r\x1b[2KRunning    1.2s | one: 12 unique tx | source-two: 34 unique tx\r\x1b[2K"
+        );
     }
 
     #[tokio::test]
