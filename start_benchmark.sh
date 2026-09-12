@@ -15,6 +15,7 @@ duration="60"
 grpc_port_1="19091"
 grpc_port_2="19092"
 latest_update=false
+source_option_supplied=false
 
 usage() {
     cat <<'EOF'
@@ -30,6 +31,9 @@ Options:
   --grpc-port-2 PORT          Second local proxy gRPC port (default: 19092)
   --latest-update             Download and use the latest benchmark release
   -h, --help                  Show this help
+
+With no source options, a valid saved configuration is offered with [Y/n].
+With any source option, missing source values are prompted and the result is saved.
 EOF
 }
 
@@ -43,6 +47,9 @@ while [ "$#" -gt 0 ]; do
             option=$1
             value=$2
             shift 2
+            case "$option" in
+                --source-*) source_option_supplied=true ;;
+            esac
             case "$option" in
                 --source-1-address) source_1_address=$value ;;
                 --source-1-name) source_1_name=$value ;;
@@ -80,11 +87,6 @@ prompt() {
     printf '%s' "$answer"
 }
 
-[ -n "$source_1_address" ] || source_1_address=$(prompt "First source UDP address (IP:PORT)")
-[ -n "$source_1_name" ] || source_1_name=$(prompt "First source name")
-[ -n "$source_2_address" ] || source_2_address=$(prompt "Second source UDP address (IP:PORT)")
-[ -n "$source_2_name" ] || source_2_name=$(prompt "Second source name")
-
 split_address() {
     address=$1
     case "$address" in
@@ -97,29 +99,25 @@ split_address() {
             split_ip=${address%:*}
             split_port=${address##*:}
             ;;
-        *)
-            printf 'Invalid UDP address: %s (expected IP:PORT)\n' "$address" >&2
-            exit 2
-            ;;
+        *) return 1 ;;
+    esac
+    [ -n "$split_ip" ] || return 1
+    case "$split_ip" in
+        *[![:print:]]*) return 1 ;;
     esac
     case "$split_port" in
-        '' | *[!0-9]*)
-            printf 'Invalid port in UDP address: %s\n' "$address" >&2
-            exit 2
-            ;;
+        '' | *[!0-9]*) return 1 ;;
     esac
     if [ "$split_port" -lt 1 ] || [ "$split_port" -gt 65535 ]; then
-        printf 'Port out of range in UDP address: %s\n' "$address" >&2
-        exit 2
+        return 1
     fi
 }
 
-split_address "$source_1_address"
-source_1_ip=$split_ip
-source_1_port=$split_port
-split_address "$source_2_address"
-source_2_ip=$split_ip
-source_2_port=$split_port
+valid_source_name() {
+    case "$1" in
+        '' | *[![:print:]]*) return 1 ;;
+    esac
+}
 
 for number in "$duration" "$grpc_port_1" "$grpc_port_2"; do
     case "$number" in
@@ -188,6 +186,113 @@ if [ -L "$lock_file" ] || [ ! -f "$lock_file" ] ||
 fi
 exec 9>>"$lock_file"
 flock -x 9
+
+config_file="$cache_dir/source-config"
+config_file_safe() {
+    [ ! -L "$config_file" ] && [ -f "$config_file" ] &&
+        [ "$(stat -c %u -- "$config_file" 2>/dev/null)" = "$cache_uid" ] &&
+        [ "$(stat -c %a -- "$config_file" 2>/dev/null)" = 600 ]
+}
+
+read_source_config() {
+    {
+        IFS= read -r saved_source_1_address || return 1
+        IFS= read -r saved_source_1_name || return 1
+        IFS= read -r saved_source_2_address || return 1
+        IFS= read -r saved_source_2_name || return 1
+        if IFS= read -r extra; then
+            return 1
+        fi
+    } <"$config_file"
+    split_address "$saved_source_1_address" &&
+        split_address "$saved_source_2_address" &&
+        valid_source_name "$saved_source_1_name" &&
+        valid_source_name "$saved_source_2_name"
+}
+
+write_source_config() {
+    config_temp=$(mktemp "$cache_dir/.source-config.XXXXXX") || return 1
+    if ! chmod 600 "$config_temp"; then
+        rm -f "$config_temp"
+        return 1
+    fi
+    if ! printf '%s\n%s\n%s\n%s\n' \
+        "$source_1_address" "$source_1_name" "$source_2_address" "$source_2_name" \
+        >"$config_temp"; then
+        rm -f "$config_temp"
+        return 1
+    fi
+    if ! mv -f "$config_temp" "$config_file"; then
+        rm -f "$config_temp"
+        return 1
+    fi
+    config_file_safe
+}
+
+if [ -e "$config_file" ] || [ -L "$config_file" ]; then
+    if ! config_file_safe; then
+        printf 'Unsafe saved source configuration: %s\n' "$config_file" >&2
+        exit 1
+    fi
+fi
+
+reuse_config=false
+if [ "$source_option_supplied" = false ] && [ -f "$config_file" ]; then
+    if read_source_config; then
+        printf 'Saved source configuration:\n'
+        printf '  First source UDP address: %s\n' "$saved_source_1_address"
+        printf '  First source name: %s\n' "$saved_source_1_name"
+        printf '  Second source UDP address: %s\n' "$saved_source_2_address"
+        printf '  Second source name: %s\n' "$saved_source_2_name"
+        while :; do
+            reuse_answer=$(prompt "Use this configuration? [Y/n]")
+            case "$reuse_answer" in
+                '' | y | Y | yes | YES | Yes)
+                    source_1_address=$saved_source_1_address
+                    source_1_name=$saved_source_1_name
+                    source_2_address=$saved_source_2_address
+                    source_2_name=$saved_source_2_name
+                    reuse_config=true
+                    break
+                    ;;
+                n | N | no | NO | No) break ;;
+                *) printf 'Please answer y or n.\n' >/dev/tty ;;
+            esac
+        done
+    else
+        printf 'Ignoring invalid saved source configuration.\n' >&2
+    fi
+fi
+
+if [ "$reuse_config" = false ]; then
+    [ -n "$source_1_address" ] || source_1_address=$(prompt "First source UDP address (IP:PORT)")
+    [ -n "$source_1_name" ] || source_1_name=$(prompt "First source name")
+    [ -n "$source_2_address" ] || source_2_address=$(prompt "Second source UDP address (IP:PORT)")
+    [ -n "$source_2_name" ] || source_2_name=$(prompt "Second source name")
+fi
+
+if ! split_address "$source_1_address"; then
+    printf 'Invalid UDP address: %s (expected IP:PORT)\n' "$source_1_address" >&2
+    exit 2
+fi
+source_1_ip=$split_ip
+source_1_port=$split_port
+if ! split_address "$source_2_address"; then
+    printf 'Invalid UDP address: %s (expected IP:PORT)\n' "$source_2_address" >&2
+    exit 2
+fi
+source_2_ip=$split_ip
+source_2_port=$split_port
+if ! valid_source_name "$source_1_name" || ! valid_source_name "$source_2_name"; then
+    printf 'Source names must be non-empty and contain no control characters.\n' >&2
+    exit 2
+fi
+if [ "$reuse_config" = false ]; then
+    write_source_config || {
+        printf 'Unable to save source configuration.\n' >&2
+        exit 1
+    }
+fi
 
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/solana-shred-tx-benchmark.XXXXXX")
 proxy_pid_1=""
