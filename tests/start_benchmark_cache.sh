@@ -6,6 +6,8 @@ test_dir=$(mktemp -d)
 trap 'rm -rf "$test_dir"' EXIT INT TERM
 mkdir -p "$test_dir/bin" "$test_dir/tmp"
 export TEST_DOWNLOAD_LOG="$test_dir/downloads"
+REAL_STAT=$(command -v stat)
+export REAL_STAT
 
 cat >"$test_dir/bin/curl" <<'EOF'
 #!/bin/sh
@@ -43,6 +45,19 @@ case "$url" in
 esac
 EOF
 
+cat >"$test_dir/bin/stat" <<'EOF'
+#!/bin/sh
+last=""
+for argument in "$@"; do
+    last=$argument
+done
+if [ -n "${WRONG_OWNER_PATH:-}" ] && [ "$last" = "$WRONG_OWNER_PATH" ]; then
+    printf '999999\n'
+    exit 0
+fi
+exec "$REAL_STAT" "$@"
+EOF
+
 cat >"$test_dir/bin/sha256sum" <<'EOF'
 #!/bin/sh
 set -eu
@@ -56,7 +71,7 @@ else
 fi
 printf '%s: OK\n' "$file"
 EOF
-chmod +x "$test_dir/bin/curl" "$test_dir/bin/sha256sum"
+chmod +x "$test_dir/bin/curl" "$test_dir/bin/sha256sum" "$test_dir/bin/stat"
 
 run_launcher() {
     LATEST_TAG=$1
@@ -144,6 +159,16 @@ if TEST_TMPDIR="$non_directory_tmp" run_launcher 0.1.3 >/dev/null 2>&1; then
     echo 'Expected a non-directory cache path to be rejected' >&2
     exit 1
 fi
+
+wrong_owner_tmp="$test_dir/wrong-owner"
+wrong_owner_cache="$wrong_owner_tmp/solana-shred-tx-benchmark-cache-$uid"
+mkdir -p "$wrong_owner_cache"
+wrong_owner_mode=$(stat -c %a "$wrong_owner_cache")
+if WRONG_OWNER_PATH="$wrong_owner_cache" TEST_TMPDIR="$wrong_owner_tmp" run_launcher 0.1.3 >/dev/null 2>&1; then
+    echo 'Expected a wrong-owner cache to be rejected' >&2
+    exit 1
+fi
+[ "$(stat -c %a "$wrong_owner_cache")" = "$wrong_owner_mode" ]
 
 binary=$(cached_binary)
 printf 'corrupt\n' >"$binary"
