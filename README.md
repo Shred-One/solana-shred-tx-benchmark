@@ -10,6 +10,8 @@ The project uses the official Jito ShredStream proxy `v0.2.14` binary. The launc
 
 ## How it works
 
+![Example terminal benchmark session](docs/terminal-example.png)
+
 ```mermaid
 flowchart LR
     A[Shred source 1] -->|UDP shreds| P1[Jito proxy 1<br/>forward-only]
@@ -40,10 +42,10 @@ Pass all values when running non-interactively:
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Shred-One/solana-shred-tx-benchmark/main/start_benchmark.sh | \
   sh -s -- \
-    --source-1-address 0.0.0.0:20000 \
-    --source-1-name Jito \
-    --source-2-address 0.0.0.0:20001 \
-    --source-2-name Provider-B \
+    --source-1-address 0.0.0.0:11111 \
+    --source-1-name Source_A \
+    --source-2-address 0.0.0.0:11112 \
+    --source-2-name Shred.One \
     --duration 60
 ```
 
