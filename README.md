@@ -59,11 +59,11 @@ From a local checkout:
 ./start_benchmark.sh
 ```
 
-Use `./start_benchmark.sh --help` for all options, including custom local gRPC ports. The launcher downloads the latest Linux x86_64 benchmark release and its SHA-256 file, verifies the binary, starts both proxies, and cleans up the processes and temporary files when the benchmark exits. Set `SOLANA_SHRED_TX_BENCHMARK_BIN` to an executable path to use a specific local benchmark binary instead.
+Use `./start_benchmark.sh --help` for all options, including custom local gRPC ports. The launcher resolves the latest release tag once, downloads the Linux x86_64 benchmark and its SHA-256 file from that same tag, verifies the binary, starts both proxies, and cleans up the processes and temporary files when the benchmark exits. Set `SOLANA_SHRED_TX_BENCHMARK_BIN` to an executable path to use a specific local benchmark binary instead.
 
 ## Releases
 
-After each merge into `main`, CI tests the code, builds it for Linux x86_64, and publishes a GitHub Release. The first automated version is `0.1.0`; later releases increment the patch component (`0.1.1`, `0.1.2`, and so on). Each release contains the executable and its `.sha256` file. Rerunning a workflow for the same commit reuses that commit's existing tag.
+After each merge into `main`, CI tests the code, builds it for Linux x86_64 in a read-only job, and passes the binary and checksum to a minimal publishing job. The fixed pre-release milestone is commit `6d3af62b83f4d8bd206a4d682e0079332fd6c9d0`; each later commit's position on the first-parent history maps deterministically to `0.1.0`, `0.1.1`, and so on. Release versions therefore remain in commit order even if workflow runs finish out of order. Each release contains the executable and its `.sha256` file, and rerunning a workflow for the same commit reuses that commit's tag.
 
 ## Output
 

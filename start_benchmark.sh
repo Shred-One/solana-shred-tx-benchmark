@@ -5,7 +5,7 @@ PROXY_VERSION="v0.2.14"
 PROXY_SHA256="1b30b8e3fb4212b30774e9a277c19d42e1ff058d76f444d05afacd2e8f747a70"
 PROXY_URL="https://github.com/jito-labs/shredstream-proxy/releases/download/${PROXY_VERSION}/jito-shredstream-proxy-x86_64-unknown-linux-gnu"
 BENCHMARK_BINARY_NAME="solana-shred-tx-benchmark-x86_64-unknown-linux-gnu"
-BENCHMARK_RELEASE_URL="https://github.com/Shred-One/solana-shred-tx-benchmark/releases/latest/download"
+BENCHMARK_REPOSITORY_URL="https://github.com/Shred-One/solana-shred-tx-benchmark"
 
 source_1_address=""
 source_1_name=""
@@ -179,9 +179,28 @@ if [ -n "${SOLANA_SHRED_TX_BENCHMARK_BIN:-}" ]; then
 else
     benchmark_bin="$work_dir/$BENCHMARK_BINARY_NAME"
     checksum_file="$benchmark_bin.sha256"
-    printf 'Downloading the latest solana-shred-tx-benchmark release...\n'
-    curl -fsSL --retry 3 "$BENCHMARK_RELEASE_URL/$BENCHMARK_BINARY_NAME" -o "$benchmark_bin"
-    curl -fsSL --retry 3 "$BENCHMARK_RELEASE_URL/$BENCHMARK_BINARY_NAME.sha256" -o "$checksum_file"
+    latest_release_url=$(curl -fsSL --retry 3 -o /dev/null -w '%{url_effective}' \
+        "$BENCHMARK_REPOSITORY_URL/releases/latest")
+    latest_release_url=${latest_release_url%/}
+    release_tag=${latest_release_url##*/}
+    release_patch=${release_tag#0.1.}
+    case "$release_tag" in
+        0.1.*) ;;
+        *)
+            printf 'Invalid latest release tag: %s\n' "$release_tag" >&2
+            exit 1
+            ;;
+    esac
+    case "$release_patch" in
+        '' | *[!0-9]*)
+            printf 'Invalid latest release tag: %s\n' "$release_tag" >&2
+            exit 1
+            ;;
+    esac
+    benchmark_release_url="$BENCHMARK_REPOSITORY_URL/releases/download/$release_tag"
+    printf 'Downloading solana-shred-tx-benchmark %s...\n' "$release_tag"
+    curl -fsSL --retry 3 "$benchmark_release_url/$BENCHMARK_BINARY_NAME" -o "$benchmark_bin"
+    curl -fsSL --retry 3 "$benchmark_release_url/$BENCHMARK_BINARY_NAME.sha256" -o "$checksum_file"
     (cd "$work_dir" && sha256sum -c "$BENCHMARK_BINARY_NAME.sha256")
     chmod +x "$benchmark_bin"
 fi
