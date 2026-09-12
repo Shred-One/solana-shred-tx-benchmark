@@ -433,7 +433,8 @@ fn percentile(values: &[f64], percentile: f64) -> Option<f64> {
     if values.is_empty() {
         return None;
     }
-    let index = ((values.len() - 1) as f64 * percentile).round() as usize;
+    let rank = (values.len() as f64 * percentile).ceil() as usize;
+    let index = rank.saturating_sub(1).min(values.len() - 1);
     Some(values[index])
 }
 
@@ -481,12 +482,22 @@ mod tests {
 
     #[test]
     fn calculates_nearest_rank_percentiles() {
-        let values = (1..=101).map(f64::from).collect::<Vec<_>>();
-        assert_eq!(percentile(&values, 0.50), Some(51.0));
-        assert_eq!(percentile(&values, 0.75), Some(76.0));
-        assert_eq!(percentile(&values, 0.95), Some(96.0));
-        assert_eq!(percentile(&values, 0.99), Some(100.0));
-        assert_eq!(percentile(&[], 0.99), None);
+        for p in [0.50, 0.75, 0.95, 0.99] {
+            assert_eq!(percentile(&[1.0], p), Some(1.0));
+            assert_eq!(percentile(&[], p), None);
+        }
+
+        let pair = [1.0, 2.0];
+        assert_eq!(percentile(&pair, 0.50), Some(1.0));
+        assert_eq!(percentile(&pair, 0.75), Some(2.0));
+        assert_eq!(percentile(&pair, 0.95), Some(2.0));
+        assert_eq!(percentile(&pair, 0.99), Some(2.0));
+
+        let quartet = [1.0, 2.0, 3.0, 4.0];
+        assert_eq!(percentile(&quartet, 0.50), Some(2.0));
+        assert_eq!(percentile(&quartet, 0.75), Some(3.0));
+        assert_eq!(percentile(&quartet, 0.95), Some(4.0));
+        assert_eq!(percentile(&quartet, 0.99), Some(4.0));
     }
 
     #[tokio::test]

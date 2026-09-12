@@ -78,6 +78,8 @@ The final table contains:
 - `Win rate`: `First` divided by all matched transactions.
 - `Mean/P50/P75/P95/P99 lead`: arrival-time advantage for transactions won by that source.
 
+Percentiles use nearest-rank: for `n` sorted lead times, percentile `p` selects the 1-based rank `ceil(n * p)`.
+
 ## Repository files
 
 | File | Purpose |
