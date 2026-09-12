@@ -336,11 +336,8 @@ fn sanitize_source_name(name: &str) -> String {
     let mut characters = name.chars();
     let mut sanitized = String::with_capacity(MAX_SOURCE_NAME_LEN);
     for character in characters.by_ref().take(MAX_SOURCE_NAME_LEN) {
-        sanitized.push(if character.is_ascii_graphic() || character == ' ' {
-            character
-        } else {
-            '?'
-        });
+        let safe = character != '|' && (character.is_ascii_graphic() || character == ' ');
+        sanitized.push(if safe { character } else { '?' });
     }
     if characters.next().is_some() {
         sanitized.truncate(MAX_SOURCE_NAME_LEN - 3);
@@ -865,7 +862,7 @@ mod tests {
     fn formats_table_from_cell_widths_and_sanitizes_names() {
         assert_eq!(PROGRESS_INTERVAL, Duration::from_millis(200));
         let names = [
-            "one\n\x1b[31m\u{0301}".to_owned(),
+            "A|B\n\x1b[31m\u{0301}".to_owned(),
             "source-two-name-that-is-far-too-long-for-a-terminal".to_owned(),
         ];
         let stats = Stats {
@@ -878,23 +875,20 @@ mod tests {
         let table = stats.table(&names);
         let lines = table.lines().collect::<Vec<_>>();
         let widths = lines.iter().map(|line| line.len()).collect::<Vec<_>>();
-        let separators = lines
-            .iter()
-            .filter(|line| line.contains('|'))
-            .map(|line| {
-                line.match_indices('|')
-                    .map(|(index, _)| index)
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
+        let positions = |line: &str, delimiter| {
+            line.match_indices(delimiter)
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>()
+        };
+        let header_positions = positions(lines[0], '|');
         assert!(widths.iter().all(|width| *width == widths[0]));
-        assert!(separators
-            .iter()
-            .all(|positions| *positions == separators[0]));
-        assert_eq!(separators[0].len(), 8);
+        assert_eq!(header_positions.len(), 8);
+        assert_eq!(positions(lines[1], '+'), header_positions);
+        assert_eq!(positions(lines[2], '|'), header_positions);
+        assert_eq!(positions(lines[3], '|'), header_positions);
         assert!(!table.contains('\x1b'));
         assert!(table.contains("60000.000 ms"));
-        assert!(table.contains("S1 (one??[31m?)"));
+        assert!(table.contains("S1 (A?B??[31m?)"));
         assert!(table.contains("S2 (source-two-name-that-is-far-t...)"));
     }
 
