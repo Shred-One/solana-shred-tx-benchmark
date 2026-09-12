@@ -205,6 +205,13 @@ read_source_config() {
             return 1
         fi
     } <"$config_file"
+    actual_digest=$(sha256sum -- "$config_file") || return 1
+    actual_digest=${actual_digest%% *}
+    expected_digest=$(printf '%s\n%s\n%s\n%s\n' \
+        "$saved_source_1_address" "$saved_source_1_name" \
+        "$saved_source_2_address" "$saved_source_2_name" | sha256sum) || return 1
+    expected_digest=${expected_digest%% *}
+    [ "$actual_digest" = "$expected_digest" ] || return 1
     split_address "$saved_source_1_address" &&
         split_address "$saved_source_2_address" &&
         valid_source_name "$saved_source_1_name" &&

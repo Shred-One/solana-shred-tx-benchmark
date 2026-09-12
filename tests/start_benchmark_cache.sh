@@ -7,7 +7,8 @@ trap 'rm -rf "$test_dir"' EXIT INT TERM
 mkdir -p "$test_dir/bin" "$test_dir/tmp"
 export TEST_DOWNLOAD_LOG="$test_dir/downloads"
 REAL_STAT=$(command -v stat)
-export REAL_STAT
+REAL_SHA256SUM=$(command -v sha256sum)
+export REAL_STAT REAL_SHA256SUM
 
 cat >"$test_dir/bin/curl" <<'EOF'
 #!/bin/sh
@@ -61,6 +62,9 @@ EOF
 cat >"$test_dir/bin/sha256sum" <<'EOF'
 #!/bin/sh
 set -eu
+if [ "${1:-}" != -c ]; then
+    exec "$REAL_SHA256SUM" "$@"
+fi
 [ "$1" = -c ]
 if [ "$2" = - ]; then
     read -r expected file
@@ -264,6 +268,17 @@ printf 'extra' >>"$source_config"
 output=$(run_config_interactive '127.0.0.1:22601\nrepaired-eof\n127.0.0.1:22602\nsecond\n')
 printf '%s\n' "$output" | grep -q 'Ignoring invalid saved source configuration.'
 grep -q '^repaired-eof$' "$TEST_BENCHMARK_LOG"
+
+printf '127.0.0.1:22701\nfirst\000hidden\n127.0.0.1:22702\nsecond\n' >"$source_config"
+output=$(run_config_interactive '127.0.0.1:22801\nrepaired-field-nul\n127.0.0.1:22802\nsecond\n')
+printf '%s\n' "$output" | grep -q 'Ignoring invalid saved source configuration.'
+grep -q '^repaired-field-nul$' "$TEST_BENCHMARK_LOG"
+
+printf '%s\n' 127.0.0.1:22901 first 127.0.0.1:22902 second >"$source_config"
+printf '\000' >>"$source_config"
+output=$(run_config_interactive '127.0.0.1:23001\nrepaired-trailing-nul\n127.0.0.1:23002\nsecond\n')
+printf '%s\n' "$output" | grep -q 'Ignoring invalid saved source configuration.'
+grep -q '^repaired-trailing-nul$' "$TEST_BENCHMARK_LOG"
 
 prompt_fifo="$test_dir/prompt-input"
 prompt_log="$test_dir/prompt.log"

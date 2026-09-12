@@ -5,9 +5,11 @@ use std::{
     env,
     error::Error,
     fmt,
+    fs::OpenOptions,
     future::Future,
     io::{self, IsTerminal, Write},
-    sync::{mpsc as sync_mpsc, Arc, Condvar, Mutex},
+    os::unix::fs::OpenOptionsExt,
+    sync::{Arc, Condvar, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -39,8 +41,8 @@ Options:
 
 const START_DELAY: Duration = Duration::from_millis(10);
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
-const PROGRESS_FINISH_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_SOURCE_NAME_LEN: usize = 32;
+const O_NONBLOCK: i32 = 0o4000;
 
 #[derive(Debug)]
 struct Config {
@@ -109,22 +111,32 @@ impl Stats {
         }
     }
 
-    fn print(&mut self, names: &[String; 2], elapsed: Duration) {
+    fn write_results(
+        &mut self,
+        names: &[String; 2],
+        elapsed: Duration,
+        output: &mut impl Write,
+    ) -> io::Result<()> {
         for values in &mut self.leads_ms {
             values.sort_by(f64::total_cmp);
         }
 
         let labels = source_labels(names);
-        println!("\nBenchmark results ({:.1}s)", elapsed.as_secs_f64());
-        println!(
+        writeln!(
+            output,
+            "\nBenchmark results ({:.1}s)",
+            elapsed.as_secs_f64()
+        )?;
+        writeln!(
+            output,
             "Matched transactions: {} | Only {}: {} | Only {}: {}",
             self.matched,
             labels[0],
             self.unique[0].saturating_sub(self.matched),
             labels[1],
             self.unique[1].saturating_sub(self.matched)
-        );
-        println!("{}", self.table(names));
+        )?;
+        writeln!(output, "{}", self.table(names))
     }
 
     fn table(&self, names: &[String; 2]) -> String {
@@ -177,8 +189,7 @@ struct RenderState {
 
 struct ProgressReporter {
     state: Option<Arc<(Mutex<RenderState>, Condvar)>>,
-    worker: Option<thread::JoinHandle<()>>,
-    done: Option<sync_mpsc::Receiver<io::Result<()>>>,
+    worker: Option<thread::JoinHandle<io::Result<()>>>,
 }
 
 impl ProgressReporter {
@@ -187,20 +198,15 @@ impl ProgressReporter {
             return Self {
                 state: None,
                 worker: None,
-                done: None,
             };
         }
 
         let state = Arc::new((Mutex::new(RenderState::default()), Condvar::new()));
         let worker_state = Arc::clone(&state);
-        let (done_sender, done) = sync_mpsc::sync_channel(1);
-        let worker = thread::spawn(move || {
-            let _ = done_sender.send(render_progress(output, worker_state));
-        });
+        let worker = thread::spawn(move || render_progress(output, worker_state));
         Self {
             state: Some(state),
             worker: Some(worker),
-            done: Some(done),
         }
     }
 
@@ -229,32 +235,28 @@ impl ProgressReporter {
                 .finish = true;
             changed.notify_one();
         }
-        let Some(done) = self.done.take() else {
-            return Ok(());
-        };
-        match done.recv_timeout(PROGRESS_FINISH_TIMEOUT) {
-            Ok(result) => {
-                self.worker
-                    .take()
-                    .expect("visible progress has a worker")
-                    .join()
-                    .map_err(|_| io::Error::other("progress renderer panicked"))?;
-                result
-            }
-            Err(sync_mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "progress renderer did not stop",
-            )),
-            Err(sync_mpsc::RecvTimeoutError::Disconnected) => {
-                self.worker
-                    .take()
-                    .expect("visible progress has a worker")
-                    .join()
-                    .map_err(|_| io::Error::other("progress renderer panicked"))?;
-                Err(io::Error::other(
-                    "progress renderer stopped without a result",
-                ))
-            }
+        match self.worker.take() {
+            Some(worker) => worker
+                .join()
+                .map_err(|_| io::Error::other("progress renderer panicked"))?,
+            None => Ok(()),
+        }
+    }
+}
+
+fn terminal_progress() -> ProgressReporter {
+    if !io::stdout().is_terminal() {
+        return ProgressReporter::new(false, io::sink());
+    }
+    match OpenOptions::new()
+        .write(true)
+        .custom_flags(O_NONBLOCK)
+        .open("/dev/tty")
+    {
+        Ok(terminal) => ProgressReporter::new(true, terminal),
+        Err(error) => {
+            eprintln!("Progress display unavailable: {error}");
+            ProgressReporter::new(false, io::sink())
         }
     }
 }
@@ -474,8 +476,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         config.duration.as_secs()
     );
 
-    let progress = ProgressReporter::new(io::stdout().is_terminal(), io::stdout());
+    let progress = terminal_progress();
+    let progress_visible = progress.visible();
     let mut stats = Stats::default();
+    let progress_error;
     let cutoff = match collect_until(
         &mut receiver,
         start,
@@ -488,7 +492,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .await
     {
         Ok(cutoff) => {
-            progress.finish()?;
+            progress_error = progress.finish().err();
             cutoff
         }
         Err(error) => {
@@ -507,7 +511,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
         task.abort();
     }
     drain_result?;
-    stats.print(&config.names, cutoff.saturating_duration_since(start));
+    {
+        let mut output = io::stdout().lock();
+        if progress_visible {
+            write!(output, "\r\x1b[2K")?;
+        }
+        stats.write_results(
+            &config.names,
+            cutoff.saturating_duration_since(start),
+            &mut output,
+        )?;
+    }
+    if let Some(error) = progress_error {
+        eprintln!("Progress display stopped: {error}");
+    }
     Ok(())
 }
 
@@ -728,7 +745,10 @@ fn format_milliseconds(value: Option<f64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc as std_mpsc;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc as std_mpsc,
+    };
 
     #[derive(Clone, Default)]
     struct SharedWriter(Arc<Mutex<Vec<u8>>>);
@@ -767,6 +787,19 @@ mod tests {
                 }
             }
             self.output.write(buffer)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct WouldBlockWriter(Arc<AtomicUsize>);
+
+    impl Write for WouldBlockWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
         }
 
         fn flush(&mut self) -> io::Result<()> {
@@ -985,31 +1018,29 @@ mod tests {
     }
 
     #[test]
-    fn finish_times_out_when_progress_writer_remains_blocked() {
-        let output = SharedWriter::default();
-        let (started_sender, started_receiver) = std_mpsc::channel();
-        let gate = Arc::new((Mutex::new(false), Condvar::new()));
-        let progress = ProgressReporter::new(
-            true,
-            BlockingWriter {
-                output,
-                started: Some(started_sender),
-                gate: Arc::clone(&gate),
-            },
-        );
+    fn progress_failure_is_joined_before_results_are_written() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let progress = ProgressReporter::new(true, WouldBlockWriter(Arc::clone(&attempts)));
         progress.report(Duration::from_secs(1), [1, 1]);
-        started_receiver
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap();
 
         let started = Instant::now();
         let error = progress.finish().unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
         assert!(started.elapsed() < Duration::from_secs(1));
 
-        let (lock, changed) = &*gate;
-        *lock.lock().unwrap() = true;
-        changed.notify_one();
+        let attempts_after_finish = attempts.load(Ordering::SeqCst);
+        let output = SharedWriter::default();
+        let mut stats = Stats::default();
+        stats
+            .write_results(
+                &["one".to_owned(), "two".to_owned()],
+                Duration::from_secs(60),
+                &mut output.clone(),
+            )
+            .unwrap();
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(attempts.load(Ordering::SeqCst), attempts_after_finish);
+        assert!(output.text().contains("Benchmark results (60.0s)"));
     }
 
     #[tokio::test]
