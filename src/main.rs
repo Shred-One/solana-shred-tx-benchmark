@@ -116,8 +116,10 @@ impl Stats {
             names[1],
             self.unique[1].saturating_sub(self.matched)
         );
-        println!("| Source | Unique tx | First | Win rate | Mean lead | P50 lead | P95 lead |");
-        println!("|---|---:|---:|---:|---:|---:|---:|");
+        println!(
+            "| Source | Unique tx | First | Win rate | Mean lead | P50 lead | P75 lead | P95 lead | P99 lead |"
+        );
+        println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|");
         for (source, name) in names.iter().enumerate() {
             let win_rate = if self.matched == 0 {
                 0.0
@@ -125,14 +127,16 @@ impl Stats {
                 self.first[source] as f64 * 100.0 / self.matched as f64
             };
             println!(
-                "| {} | {} | {} | {:.1}% | {} | {} | {} |",
+                "| {} | {} | {} | {:.1}% | {} | {} | {} | {} | {} |",
                 name.replace('|', "\\|"),
                 self.unique[source],
                 self.first[source],
                 win_rate,
                 format_milliseconds(mean(&self.leads_ms[source])),
                 format_milliseconds(percentile(&self.leads_ms[source], 0.50)),
+                format_milliseconds(percentile(&self.leads_ms[source], 0.75)),
                 format_milliseconds(percentile(&self.leads_ms[source], 0.95)),
+                format_milliseconds(percentile(&self.leads_ms[source], 0.99)),
             );
         }
     }
@@ -429,7 +433,8 @@ fn percentile(values: &[f64], percentile: f64) -> Option<f64> {
     if values.is_empty() {
         return None;
     }
-    let index = ((values.len() - 1) as f64 * percentile).round() as usize;
+    let rank = (values.len() as f64 * percentile).ceil() as usize;
+    let index = rank.saturating_sub(1).min(values.len() - 1);
     Some(values[index])
 }
 
@@ -477,9 +482,22 @@ mod tests {
 
     #[test]
     fn calculates_nearest_rank_percentiles() {
-        assert_eq!(percentile(&[1.0, 2.0, 3.0, 4.0, 5.0], 0.50), Some(3.0));
-        assert_eq!(percentile(&[1.0, 2.0, 3.0, 4.0, 5.0], 0.95), Some(5.0));
-        assert_eq!(percentile(&[], 0.50), None);
+        for p in [0.50, 0.75, 0.95, 0.99] {
+            assert_eq!(percentile(&[1.0], p), Some(1.0));
+            assert_eq!(percentile(&[], p), None);
+        }
+
+        let pair = [1.0, 2.0];
+        assert_eq!(percentile(&pair, 0.50), Some(1.0));
+        assert_eq!(percentile(&pair, 0.75), Some(2.0));
+        assert_eq!(percentile(&pair, 0.95), Some(2.0));
+        assert_eq!(percentile(&pair, 0.99), Some(2.0));
+
+        let quartet = [1.0, 2.0, 3.0, 4.0];
+        assert_eq!(percentile(&quartet, 0.50), Some(2.0));
+        assert_eq!(percentile(&quartet, 0.75), Some(3.0));
+        assert_eq!(percentile(&quartet, 0.95), Some(4.0));
+        assert_eq!(percentile(&quartet, 0.99), Some(4.0));
     }
 
     #[tokio::test]

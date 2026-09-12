@@ -1,6 +1,6 @@
 # Solana Shred Transaction Benchmark
 
-Compare transaction arrival times from two Solana shred sources. The benchmark matches transactions by their first signature and reports which source delivered each matched transaction first, including mean, P50, and P95 lead times.
+Compare transaction arrival times from two Solana shred sources. The benchmark matches transactions by their first signature and reports which source delivered each matched transaction first, including mean, P50, P75, P95, and P99 lead times.
 
 The project uses the official Jito ShredStream proxy `v0.2.14` binary. The launcher verifies its pinned SHA-256 digest before execution:
 
@@ -76,7 +76,9 @@ The final table contains:
 - `Unique tx`: distinct transactions decoded from that source.
 - `First`: matched transactions delivered first by that source.
 - `Win rate`: `First` divided by all matched transactions.
-- `Mean/P50/P95 lead`: arrival-time advantage for transactions won by that source.
+- `Mean/P50/P75/P95/P99 lead`: arrival-time advantage for transactions won by that source.
+
+Percentiles use nearest-rank: for `n` sorted lead times, percentile `p` selects the 1-based rank `ceil(n * p)`.
 
 ## Repository files
 
