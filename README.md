@@ -73,7 +73,9 @@ A failed or cancelled release run also keeps its sequence number. To preserve a 
 
 ## Output
 
-When stdout is a terminal, the benchmark updates one in-place progress line every 200 ms with elapsed time and each source's cumulative unique transaction count. Redirected output stays static. The progress line is cleared before the final fixed-width table or after Ctrl+C.
+When stdout is a terminal, a dedicated renderer updates one bounded in-place progress line every 200 ms with elapsed time and the cumulative unique transaction counts for `S1` and `S2`. The measurement loop only replaces a single latest-state slot, so slow terminal output cannot create a transaction backlog. Redirected output stays static. The progress line is cleared before the final table, after Ctrl+C, or on an error.
+
+The final table sizes every column from its complete set of cells. Source names are shown with stable `S1`/`S2` aliases, limited to 32 characters, and non-ASCII or terminal-control characters are replaced with `?` so alignment and terminal state remain safe without locale-specific dependencies.
 
 The final aligned table contains:
 

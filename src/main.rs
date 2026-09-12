@@ -5,7 +5,10 @@ use std::{
     env,
     error::Error,
     fmt,
+    future::Future,
     io::{self, IsTerminal, Write},
+    sync::{Arc, Condvar, Mutex},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -36,6 +39,7 @@ Options:
 
 const START_DELAY: Duration = Duration::from_millis(10);
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
+const MAX_SOURCE_NAME_LEN: usize = 32;
 
 #[derive(Debug)]
 struct Config {
@@ -109,27 +113,22 @@ impl Stats {
             values.sort_by(f64::total_cmp);
         }
 
+        let labels = source_labels(names);
         println!("\nBenchmark results ({:.1}s)", elapsed.as_secs_f64());
         println!(
             "Matched transactions: {} | Only {}: {} | Only {}: {}",
             self.matched,
-            names[0],
+            labels[0],
             self.unique[0].saturating_sub(self.matched),
-            names[1],
+            labels[1],
             self.unique[1].saturating_sub(self.matched)
         );
         println!("{}", self.table(names));
     }
 
     fn table(&self, names: &[String; 2]) -> String {
-        let source_width = names
-            .iter()
-            .map(|name| name.chars().count())
-            .max()
-            .unwrap_or(0)
-            .max("Source".len());
-        let mut lines = vec![format!(
-            "{:<source_width$}  {:>10}  {:>10}  {:>8}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}",
+        let labels = source_labels(names);
+        let mut rows = vec![[
             "Source",
             "Unique tx",
             "First",
@@ -138,66 +137,118 @@ impl Stats {
             "P50 lead",
             "P75 lead",
             "P95 lead",
-            "P99 lead"
-        )];
-        lines.push(
-            [source_width, 10, 10, 8, 10, 10, 10, 10, 10]
-                .map(|width| "-".repeat(width))
-                .join("  "),
-        );
-        for (source, name) in names.iter().enumerate() {
+            "P99 lead",
+        ]
+        .map(str::to_owned)];
+        for (source, label) in labels.into_iter().enumerate() {
             let win_rate = if self.matched == 0 {
                 0.0
             } else {
                 self.first[source] as f64 * 100.0 / self.matched as f64
             };
-            let win_rate = format!("{win_rate:.1}%");
-            lines.push(format!(
-                "{:<source_width$}  {:>10}  {:>10}  {:>8}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}",
-                name,
-                self.unique[source],
-                self.first[source],
-                win_rate,
+            rows.push([
+                label,
+                self.unique[source].to_string(),
+                self.first[source].to_string(),
+                format!("{win_rate:.1}%"),
                 format_milliseconds(mean(&self.leads_ms[source])),
                 format_milliseconds(percentile(&self.leads_ms[source], 0.50)),
                 format_milliseconds(percentile(&self.leads_ms[source], 0.75)),
                 format_milliseconds(percentile(&self.leads_ms[source], 0.95)),
                 format_milliseconds(percentile(&self.leads_ms[source], 0.99)),
-            ));
+            ]);
         }
-        lines.join("\n")
+        render_table(&rows)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ProgressSnapshot {
+    elapsed: Duration,
+    unique: [u64; 2],
+}
+
+#[derive(Default)]
+struct RenderState {
+    latest: Option<ProgressSnapshot>,
+    finish: bool,
+}
+
+struct ProgressReporter {
+    state: Option<Arc<(Mutex<RenderState>, Condvar)>>,
+    worker: Option<thread::JoinHandle<io::Result<()>>>,
+}
+
+impl ProgressReporter {
+    fn new(visible: bool, output: impl Write + Send + 'static) -> Self {
+        if !visible {
+            return Self {
+                state: None,
+                worker: None,
+            };
+        }
+
+        let state = Arc::new((Mutex::new(RenderState::default()), Condvar::new()));
+        let worker_state = Arc::clone(&state);
+        let worker = thread::spawn(move || render_progress(output, worker_state));
+        Self {
+            state: Some(state),
+            worker: Some(worker),
+        }
+    }
+
+    fn visible(&self) -> bool {
+        self.state.is_some()
+    }
+
+    fn report(&self, elapsed: Duration, unique: [u64; 2]) {
+        let Some(state) = &self.state else {
+            return;
+        };
+        let (lock, changed) = &**state;
+        if let Ok(mut state) = lock.try_lock() {
+            if !state.finish {
+                state.latest = Some(ProgressSnapshot { elapsed, unique });
+                changed.notify_one();
+            }
+        }
+    }
+
+    fn finish(mut self) -> io::Result<()> {
+        if let Some(state) = &self.state {
+            let (lock, changed) = &**state;
+            lock.lock()
+                .map_err(|_| io::Error::other("progress state lock poisoned"))?
+                .finish = true;
+            changed.notify_one();
+        }
+        match self.worker.take() {
+            Some(worker) => worker
+                .join()
+                .map_err(|_| io::Error::other("progress renderer panicked"))?,
+            None => Ok(()),
+        }
     }
 }
 
 struct ProgressLine {
-    visible: bool,
     drawn: bool,
 }
 
 impl ProgressLine {
-    fn new(visible: bool) -> Self {
-        Self {
-            visible,
-            drawn: false,
-        }
+    fn new() -> Self {
+        Self { drawn: false }
     }
 
     fn update(
         &mut self,
         output: &mut impl Write,
-        names: &[String; 2],
         elapsed: Duration,
         unique: [u64; 2],
     ) -> io::Result<()> {
-        if self.visible {
-            write!(
-                output,
-                "\r\x1b[2K{}",
-                format_progress(names, elapsed, unique)
-            )?;
-            output.flush()?;
-            self.drawn = true;
-        }
+        write!(output, "\r\x1b[2K{}", format_progress(elapsed, unique))?;
+        output.flush()?;
+        self.drawn = true;
         Ok(())
     }
 
@@ -211,15 +262,94 @@ impl ProgressLine {
     }
 }
 
-fn format_progress(names: &[String; 2], elapsed: Duration, unique: [u64; 2]) -> String {
+fn render_progress(
+    mut output: impl Write,
+    state: Arc<(Mutex<RenderState>, Condvar)>,
+) -> io::Result<()> {
+    let mut line = ProgressLine::new();
+    loop {
+        let (snapshot, finish) = {
+            let (lock, changed) = &*state;
+            let mut state = lock
+                .lock()
+                .map_err(|_| io::Error::other("progress state lock poisoned"))?;
+            while state.latest.is_none() && !state.finish {
+                state = changed
+                    .wait(state)
+                    .map_err(|_| io::Error::other("progress state lock poisoned"))?;
+            }
+            (state.latest.take(), state.finish)
+        };
+        if let Some(snapshot) = snapshot {
+            line.update(&mut output, snapshot.elapsed, snapshot.unique)?;
+        }
+        if finish {
+            return line.clear(&mut output);
+        }
+    }
+}
+
+fn format_progress(elapsed: Duration, unique: [u64; 2]) -> String {
+    let tenths = elapsed.as_millis() / 100;
+    let elapsed = if tenths <= 999_999 {
+        format!("{}.{:01}s", tenths / 10, tenths % 10)
+    } else {
+        ">99999s".to_owned()
+    };
     format!(
-        "Running {:>6.1}s | {}: {} unique tx | {}: {} unique tx",
-        elapsed.as_secs_f64(),
-        names[0],
-        unique[0],
-        names[1],
-        unique[1]
+        "Running {elapsed:>8} | S1 {:>20} | S2 {:>20}",
+        unique[0], unique[1]
     )
+}
+
+fn sanitize_source_name(name: &str) -> String {
+    let mut characters = name.chars();
+    let mut sanitized = String::with_capacity(MAX_SOURCE_NAME_LEN);
+    for character in characters.by_ref().take(MAX_SOURCE_NAME_LEN) {
+        sanitized.push(if character.is_ascii_graphic() || character == ' ' {
+            character
+        } else {
+            '?'
+        });
+    }
+    if characters.next().is_some() {
+        sanitized.truncate(MAX_SOURCE_NAME_LEN - 3);
+        sanitized.push_str("...");
+    }
+    sanitized
+}
+
+fn source_labels(names: &[String; 2]) -> [String; 2] {
+    [
+        format!("S1 ({})", sanitize_source_name(&names[0])),
+        format!("S2 ({})", sanitize_source_name(&names[1])),
+    ]
+}
+
+fn render_table(rows: &[[String; 9]]) -> String {
+    let widths: [usize; 9] =
+        std::array::from_fn(|column| rows.iter().map(|row| row[column].len()).max().unwrap_or(0));
+    let mut lines = Vec::with_capacity(rows.len() + 1);
+    for (row_index, row) in rows.iter().enumerate() {
+        if row_index == 1 {
+            lines.push(widths.map(|width| "-".repeat(width)).join("  "));
+        }
+        lines.push(
+            row.iter()
+                .enumerate()
+                .map(|(column, cell)| {
+                    let width = widths[column];
+                    if column == 0 {
+                        format!("{cell:<width$}")
+                    } else {
+                        format!("{cell:>width$}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("  "),
+        );
+    }
+    lines.join("\n")
 }
 
 #[derive(Debug)]
@@ -232,6 +362,53 @@ impl fmt::Display for MessageError {
 }
 
 impl Error for MessageError {}
+
+async fn collect_until<S>(
+    receiver: &mut mpsc::UnboundedReceiver<Event>,
+    start: Instant,
+    scheduled_cutoff: Instant,
+    duration: Duration,
+    stats: &mut Stats,
+    progress: &ProgressReporter,
+    interrupt: S,
+) -> Result<Instant, MessageError>
+where
+    S: Future<Output = io::Result<()>>,
+{
+    let deadline = tokio::time::sleep_until(scheduled_cutoff.into());
+    tokio::pin!(deadline);
+    tokio::pin!(interrupt);
+    let mut progress_interval = tokio::time::interval(PROGRESS_INTERVAL);
+    progress_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            _ = &mut deadline => return Ok(scheduled_cutoff),
+            signal = &mut interrupt => {
+                signal.map_err(|error| MessageError(format!("failed to listen for Ctrl+C: {error}")))?;
+                return Ok(Instant::now());
+            }
+            _ = progress_interval.tick(), if progress.visible() => {
+                progress.report(
+                    Instant::now().saturating_duration_since(start).min(duration),
+                    stats.unique,
+                );
+            }
+            event = receiver.recv() => match event {
+                Some(Event::Transaction { source, id, received_at }) => {
+                    if received_at >= start && received_at <= scheduled_cutoff {
+                        stats.observe(source, id, received_at);
+                    }
+                }
+                Some(Event::Error { source, message }) => {
+                    return Err(MessageError(format!("S{}: {message}", source + 1)));
+                }
+                Some(Event::Ready(_) | Event::Finished(_)) => {}
+                None => return Err(MessageError("both source streams closed".to_owned())),
+            }
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -269,49 +446,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
         config.duration.as_secs()
     );
 
-    let deadline = tokio::time::sleep_until(scheduled_cutoff.into());
-    tokio::pin!(deadline);
-    let mut progress_interval = tokio::time::interval(PROGRESS_INTERVAL);
-    progress_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut progress = ProgressLine::new(io::stdout().is_terminal());
+    let progress = ProgressReporter::new(io::stdout().is_terminal(), io::stdout());
     let mut stats = Stats::default();
-    let cutoff = loop {
-        tokio::select! {
-            _ = &mut deadline => break scheduled_cutoff,
-            signal = tokio::signal::ctrl_c() => {
-                signal?;
-                break Instant::now();
+    let cutoff = match collect_until(
+        &mut receiver,
+        start,
+        scheduled_cutoff,
+        config.duration,
+        &mut stats,
+        &progress,
+        tokio::signal::ctrl_c(),
+    )
+    .await
+    {
+        Ok(cutoff) => {
+            progress.finish()?;
+            cutoff
+        }
+        Err(error) => {
+            for task in &tasks {
+                task.abort();
             }
-            _ = progress_interval.tick(), if progress.visible => {
-                progress.update(
-                    &mut io::stdout().lock(),
-                    &config.names,
-                    Instant::now().saturating_duration_since(start).min(config.duration),
-                    stats.unique,
-                )?;
-            }
-            event = receiver.recv() => match event {
-                Some(Event::Transaction { source, id, received_at }) => {
-                    if received_at >= start && received_at <= scheduled_cutoff {
-                        stats.observe(source, id, received_at);
-                    }
-                }
-                Some(Event::Error { source, message }) => {
-                    progress.clear(&mut io::stdout().lock())?;
-                    for task in tasks {
-                        task.abort();
-                    }
-                    return Err(MessageError(format!("{}: {message}", config.names[source])).into());
-                }
-                Some(Event::Ready(_) | Event::Finished(_)) => {}
-                None => {
-                    progress.clear(&mut io::stdout().lock())?;
-                    return Err(MessageError("both source streams closed".to_owned()).into());
-                }
-            }
+            let _ = progress.finish();
+            return Err(error.into());
         }
     };
-    progress.clear(&mut io::stdout().lock())?;
 
     drop(control_sender);
     let drain_result =
@@ -514,8 +673,8 @@ fn parse_args(arguments: impl Iterator<Item = String>) -> Result<Option<Config>,
             take(&mut values, "--source-2-url")?,
         ],
         names: [
-            take(&mut values, "--source-1-name")?,
-            take(&mut values, "--source-2-name")?,
+            sanitize_source_name(&take(&mut values, "--source-1-name")?),
+            sanitize_source_name(&take(&mut values, "--source-2-name")?),
         ],
         duration: Duration::from_secs(duration),
     }))
@@ -541,6 +700,51 @@ fn format_milliseconds(value: Option<f64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc as std_mpsc;
+
+    #[derive(Clone, Default)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl SharedWriter {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl Write for SharedWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct BlockingWriter {
+        output: SharedWriter,
+        started: Option<std_mpsc::Sender<()>>,
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl Write for BlockingWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if let Some(started) = self.started.take() {
+                let _ = started.send(());
+                let (lock, changed) = &*self.gate;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = changed.wait(released).unwrap();
+                }
+            }
+            self.output.write(buffer)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn records_unique_and_out_of_order_arrivals() {
@@ -597,37 +801,159 @@ mod tests {
     }
 
     #[test]
-    fn formats_fixed_width_table_and_tty_progress() {
+    fn formats_table_from_cell_widths_and_sanitizes_names() {
         assert_eq!(PROGRESS_INTERVAL, Duration::from_millis(200));
-        let names = ["one".to_owned(), "source-two".to_owned()];
+        let names = [
+            "one\n\x1b[31m\u{0301}".to_owned(),
+            "source-two-name-that-is-far-too-long-for-a-terminal".to_owned(),
+        ];
         let stats = Stats {
             unique: [12, 3_456],
             first: [7, 3],
             matched: 10,
-            leads_ms: [vec![0.125], vec![12.5]],
+            leads_ms: [vec![60_000.0], vec![12.5]],
             ..Stats::default()
         };
         let table = stats.table(&names);
         let widths = table.lines().map(str::len).collect::<Vec<_>>();
         assert!(widths.iter().all(|width| *width == widths[0]));
         assert!(!table.contains('|'));
+        assert!(!table.contains('\x1b'));
+        assert!(table.contains("60000.000 ms"));
+        assert!(table.contains("S1 (one??[31m?)"));
+        assert!(table.contains("S2 (source-two-name-that-is-far-t...)"));
+    }
 
-        let mut output = Vec::new();
-        let mut hidden = ProgressLine::new(false);
-        hidden
-            .update(&mut output, &names, Duration::from_millis(1200), [12, 34])
-            .unwrap();
-        assert!(output.is_empty());
-
-        let mut visible = ProgressLine::new(true);
-        visible
-            .update(&mut output, &names, Duration::from_millis(1200), [12, 34])
-            .unwrap();
-        visible.clear(&mut output).unwrap();
+    #[test]
+    fn progress_is_bounded_and_hidden_output_stays_empty() {
+        let progress = format_progress(Duration::MAX, [u64::MAX; 2]);
+        assert_eq!(progress.len(), 68);
         assert_eq!(
-            String::from_utf8(output).unwrap(),
-            "\r\x1b[2KRunning    1.2s | one: 12 unique tx | source-two: 34 unique tx\r\x1b[2K"
+            progress,
+            "Running  >99999s | S1 18446744073709551615 | S2 18446744073709551615"
         );
+
+        let output = SharedWriter::default();
+        let hidden = ProgressReporter::new(false, output.clone());
+        hidden.report(Duration::from_secs(1), [12, 34]);
+        hidden.finish().unwrap();
+        assert!(output.text().is_empty());
+    }
+
+    #[tokio::test]
+    async fn clears_progress_after_success_and_ctrl_c() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let output = SharedWriter::default();
+        let progress = ProgressReporter::new(true, output.clone());
+        progress.report(Duration::ZERO, [0, 0]);
+        let start = Instant::now();
+        let scheduled_cutoff = start + Duration::from_millis(20);
+        let mut stats = Stats::default();
+        let cutoff = collect_until(
+            &mut receiver,
+            start,
+            scheduled_cutoff,
+            Duration::from_millis(20),
+            &mut stats,
+            &progress,
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(cutoff, scheduled_cutoff);
+        progress.finish().unwrap();
+        assert!(output.text().ends_with("\r\x1b[2K"));
+        drop(sender);
+
+        let (_sender, mut receiver) = mpsc::unbounded_channel();
+        let output = SharedWriter::default();
+        let progress = ProgressReporter::new(true, output.clone());
+        progress.report(Duration::ZERO, [0, 0]);
+        let start = Instant::now();
+        let scheduled_cutoff = start + Duration::from_secs(60);
+        let cutoff = collect_until(
+            &mut receiver,
+            start,
+            scheduled_cutoff,
+            Duration::from_secs(60),
+            &mut Stats::default(),
+            &progress,
+            std::future::ready(Ok(())),
+        )
+        .await
+        .unwrap();
+        assert!(cutoff < scheduled_cutoff);
+        progress.finish().unwrap();
+        assert!(output.text().ends_with("\r\x1b[2K"));
+    }
+
+    #[tokio::test]
+    async fn blocked_writer_keeps_only_latest_progress_and_does_not_block_events() {
+        let output = SharedWriter::default();
+        let (started_sender, started_receiver) = std_mpsc::channel();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let progress = ProgressReporter::new(
+            true,
+            BlockingWriter {
+                output: output.clone(),
+                started: Some(started_sender),
+                gate: Arc::clone(&gate),
+            },
+        );
+        progress.report(Duration::from_secs(1), [1, 1]);
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let start = Instant::now();
+        let scheduled_cutoff = start + Duration::from_secs(60);
+        for source in 0..2 {
+            sender
+                .send(Event::Transaction {
+                    source,
+                    id: [source as u8; 64],
+                    received_at: start + Duration::from_millis(1),
+                })
+                .unwrap();
+        }
+        sender
+            .send(Event::Error {
+                source: 0,
+                message: "broken".to_owned(),
+            })
+            .unwrap();
+
+        let mut stats = Stats::default();
+        let error = tokio::time::timeout(
+            Duration::from_millis(100),
+            collect_until(
+                &mut receiver,
+                start,
+                scheduled_cutoff,
+                Duration::from_secs(60),
+                &mut stats,
+                &progress,
+                std::future::pending(),
+            ),
+        )
+        .await
+        .expect("event consumer blocked on progress writer")
+        .unwrap_err();
+        assert_eq!(error.to_string(), "S1: broken");
+        assert_eq!(stats.unique, [1, 1]);
+
+        progress.report(Duration::from_secs(2), [2, 2]);
+        progress.report(Duration::from_secs(3), [3, 3]);
+        let (lock, changed) = &*gate;
+        *lock.lock().unwrap() = true;
+        changed.notify_one();
+        progress.finish().unwrap();
+
+        let output = output.text();
+        assert!(!output.contains(&format_progress(Duration::from_secs(2), [2, 2])));
+        assert!(output.contains(&format_progress(Duration::from_secs(3), [3, 3])));
+        assert!(output.ends_with("\r\x1b[2K"));
     }
 
     #[tokio::test]
