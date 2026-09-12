@@ -7,7 +7,8 @@ trap 'rm -rf "$test_dir"' EXIT INT TERM
 mkdir -p "$test_dir/bin" "$test_dir/tmp"
 export TEST_DOWNLOAD_LOG="$test_dir/downloads"
 REAL_STAT=$(command -v stat)
-export REAL_STAT
+REAL_SHA256SUM=$(command -v sha256sum)
+export REAL_STAT REAL_SHA256SUM
 
 cat >"$test_dir/bin/curl" <<'EOF'
 #!/bin/sh
@@ -61,6 +62,9 @@ EOF
 cat >"$test_dir/bin/sha256sum" <<'EOF'
 #!/bin/sh
 set -eu
+if [ "${1:-}" != -c ]; then
+    exec "$REAL_SHA256SUM" "$@"
+fi
 [ "$1" = -c ]
 if [ "$2" = - ]; then
     read -r expected file
@@ -71,7 +75,19 @@ else
 fi
 printf '%s: OK\n' "$file"
 EOF
-chmod +x "$test_dir/bin/curl" "$test_dir/bin/sha256sum" "$test_dir/bin/stat"
+
+export TEST_ROOT="$root"
+export TEST_BENCHMARK_LOG="$test_dir/benchmark-arguments"
+cat >"$test_dir/bin/config-benchmark" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$@" >"$TEST_BENCHMARK_LOG"
+EOF
+cat >"$test_dir/bin/run-config-launcher" <<'EOF'
+#!/bin/sh
+exec "$TEST_ROOT/start_benchmark.sh" --duration 1 "$@"
+EOF
+chmod +x "$test_dir/bin/curl" "$test_dir/bin/sha256sum" "$test_dir/bin/stat" \
+    "$test_dir/bin/config-benchmark" "$test_dir/bin/run-config-launcher"
 
 run_launcher() {
     LATEST_TAG=$1
@@ -198,4 +214,142 @@ chmod +x "$test_dir/override"
 SOLANA_SHRED_TX_BENCHMARK_BIN="$test_dir/override" run_launcher 0.1.3 >/dev/null
 [ ! -s "$TEST_DOWNLOAD_LOG" ]
 
-printf 'Launcher cache tests passed.\n'
+config_tmp="$test_dir/config-tmp"
+mkdir -p "$config_tmp"
+config_cache="$config_tmp/solana-shred-tx-benchmark-cache-$uid"
+source_config="$config_cache/source-config"
+run_config_interactive() {
+    input=$1
+    shift
+    : >"$TEST_BENCHMARK_LOG"
+    printf '%b' "$input" | PATH="$test_dir/bin:$PATH" TMPDIR="$config_tmp" \
+        SOLANA_SHRED_TX_BENCHMARK_BIN="$test_dir/bin/config-benchmark" \
+        script -qefc "run-config-launcher $*" /dev/null
+}
+
+output=$(run_config_interactive '127.0.0.1:22001\nfirst\n127.0.0.1:22002\nsecond\n')
+[ -f "$source_config" ] && [ ! -L "$source_config" ]
+[ "$(stat -c %a "$source_config")" = 600 ]
+[ "$(stat -c %u "$source_config")" = "$uid" ]
+printf '%s\n' 127.0.0.1:22001 first 127.0.0.1:22002 second >"$test_dir/expected-config"
+cmp "$test_dir/expected-config" "$source_config"
+printf '%s\n' "$output" | grep -q 'First source UDP address (IP:PORT)'
+
+output=$(run_config_interactive '\n')
+printf '%s\n' "$output" | grep -q 'Saved source configuration:'
+printf '%s\n' "$output" | grep -q 'Use this configuration? \[Y/n\]'
+grep -q '^first$' "$TEST_BENCHMARK_LOG"
+
+old_inode=$(stat -c %i "$source_config")
+run_config_interactive 'n\n127.0.0.1:22101\nchanged-one\n127.0.0.1:22102\nchanged-two\n' >/dev/null
+[ "$(stat -c %i "$source_config")" != "$old_inode" ]
+grep -q '^changed-one$' "$TEST_BENCHMARK_LOG"
+if find "$config_cache" -name '.source-config.*' | grep -q .; then
+    echo 'Expected no partial source configuration files' >&2
+    exit 1
+fi
+
+output=$(run_config_interactive '127.0.0.1:22201\n127.0.0.1:22202\ncli-two\n' --source-1-name cli-one)
+if printf '%s\n' "$output" | grep -q 'Saved source configuration:'; then
+    echo 'Expected a source CLI option to bypass saved configuration reuse' >&2
+    exit 1
+fi
+printf '%s\n' 127.0.0.1:22201 cli-one 127.0.0.1:22202 cli-two >"$test_dir/expected-config"
+cmp "$test_dir/expected-config" "$source_config"
+
+printf '%s\n' 127.0.0.1:22301 first 127.0.0.1:22302 second extra >"$source_config"
+chmod 600 "$source_config"
+output=$(run_config_interactive '127.0.0.1:22401\nrepaired-newline\n127.0.0.1:22402\nsecond\n')
+printf '%s\n' "$output" | grep -q 'Ignoring invalid saved source configuration.'
+grep -q '^repaired-newline$' "$TEST_BENCHMARK_LOG"
+
+printf '%s\n' 127.0.0.1:22501 first 127.0.0.1:22502 second >"$source_config"
+printf 'extra' >>"$source_config"
+output=$(run_config_interactive '127.0.0.1:22601\nrepaired-eof\n127.0.0.1:22602\nsecond\n')
+printf '%s\n' "$output" | grep -q 'Ignoring invalid saved source configuration.'
+grep -q '^repaired-eof$' "$TEST_BENCHMARK_LOG"
+
+printf '127.0.0.1:22701\nfirst\000hidden\n127.0.0.1:22702\nsecond\n' >"$source_config"
+output=$(run_config_interactive '127.0.0.1:22801\nrepaired-field-nul\n127.0.0.1:22802\nsecond\n')
+printf '%s\n' "$output" | grep -q 'Ignoring invalid saved source configuration.'
+grep -q '^repaired-field-nul$' "$TEST_BENCHMARK_LOG"
+
+printf '%s\n' 127.0.0.1:22901 first 127.0.0.1:22902 second >"$source_config"
+printf '\000' >>"$source_config"
+output=$(run_config_interactive '127.0.0.1:23001\nrepaired-trailing-nul\n127.0.0.1:23002\nsecond\n')
+printf '%s\n' "$output" | grep -q 'Ignoring invalid saved source configuration.'
+grep -q '^repaired-trailing-nul$' "$TEST_BENCHMARK_LOG"
+
+prompt_fifo="$test_dir/prompt-input"
+prompt_log="$test_dir/prompt.log"
+mkfifo "$prompt_fifo"
+exec 8<>"$prompt_fifo"
+PATH="$test_dir/bin:$PATH" TMPDIR="$config_tmp" \
+    SOLANA_SHRED_TX_BENCHMARK_BIN="$test_dir/bin/config-benchmark" \
+    script -qefc run-config-launcher /dev/null <"$prompt_fifo" >"$prompt_log" 2>&1 &
+prompt_pid=$!
+attempt=0
+until grep -q 'Use this configuration? \[Y/n\]' "$prompt_log"; do
+    if ! kill -0 "$prompt_pid" 2>/dev/null || [ "$attempt" -ge 40 ]; then
+        printf '\n' >&8 || true
+        exec 8>&-
+        wait "$prompt_pid" || true
+        echo 'Launcher did not wait at the saved configuration prompt' >&2
+        exit 1
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.05
+done
+TEST_TMPDIR="$config_tmp" SOLANA_SHRED_TX_BENCHMARK_BIN="$test_dir/bin/config-benchmark" \
+    run_launcher 0.1.3 >"$test_dir/concurrent.log" 2>&1 &
+concurrent_pid=$!
+attempt=0
+while kill -0 "$concurrent_pid" 2>/dev/null && [ "$attempt" -lt 80 ]; do
+    attempt=$((attempt + 1))
+    sleep 0.05
+done
+if kill -0 "$concurrent_pid" 2>/dev/null; then
+    kill "$concurrent_pid" 2>/dev/null || true
+    wait "$concurrent_pid" || true
+    printf '\n' >&8 || true
+    exec 8>&-
+    wait "$prompt_pid" || true
+    echo 'A launcher waiting at a prompt held the cache lock' >&2
+    exit 1
+fi
+wait "$concurrent_pid"
+printf '\n' >&8
+exec 8>&-
+wait "$prompt_pid"
+
+marker="$test_dir/config-was-sourced"
+printf '%s\n' 127.0.0.1:22401 "\$(touch $marker)" 127.0.0.1:22402 safe >"$source_config"
+chmod 600 "$source_config"
+run_config_interactive 'y\n' >/dev/null
+[ ! -e "$marker" ]
+grep -F -q "\$(touch $marker)" "$TEST_BENCHMARK_LOG"
+
+chmod 644 "$source_config"
+if TEST_TMPDIR="$config_tmp" run_launcher 0.1.3 >/dev/null 2>&1; then
+    echo 'Expected an overly permissive source configuration to be rejected' >&2
+    exit 1
+fi
+chmod 600 "$source_config"
+if WRONG_OWNER_PATH="$source_config" TEST_TMPDIR="$config_tmp" run_launcher 0.1.3 >/dev/null 2>&1; then
+    echo 'Expected a wrong-owner source configuration to be rejected' >&2
+    exit 1
+fi
+mv "$source_config" "$source_config.safe"
+ln -s "$source_config.safe" "$source_config"
+if TEST_TMPDIR="$config_tmp" run_launcher 0.1.3 >/dev/null 2>&1; then
+    echo 'Expected a source configuration symlink to be rejected' >&2
+    exit 1
+fi
+rm "$source_config"
+mkdir "$source_config"
+if TEST_TMPDIR="$config_tmp" run_launcher 0.1.3 >/dev/null 2>&1; then
+    echo 'Expected a source configuration directory to be rejected' >&2
+    exit 1
+fi
+
+printf 'Launcher cache and configuration tests passed.\n'

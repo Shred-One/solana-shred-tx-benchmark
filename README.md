@@ -10,6 +10,8 @@ The project uses the official Jito ShredStream proxy `v0.2.14` binary. The launc
 
 ## How it works
 
+![Example terminal benchmark session](docs/terminal-example.png)
+
 ```mermaid
 flowchart LR
     A[Shred source 1] -->|UDP shreds| P1[Jito proxy 1<br/>forward-only]
@@ -40,10 +42,10 @@ Pass all values when running non-interactively:
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Shred-One/solana-shred-tx-benchmark/main/start_benchmark.sh | \
   sh -s -- \
-    --source-1-address 0.0.0.0:20000 \
-    --source-1-name Jito \
-    --source-2-address 0.0.0.0:20001 \
-    --source-2-name Provider-B \
+    --source-1-address 0.0.0.0:11111 \
+    --source-1-name Source_A \
+    --source-2-address 0.0.0.0:11112 \
+    --source-2-name Shred.One \
     --duration 60
 ```
 
@@ -61,6 +63,8 @@ From a local checkout:
 
 Use `./start_benchmark.sh --help` for all options, including custom local gRPC ports. The launcher keeps verified binaries in `${TMPDIR:-/tmp}/solana-shred-tx-benchmark-cache-UID`; cleanup removes only runtime files and processes. It rejects cache paths with an unexpected type or owner before changing permissions or running cached files. The pinned Jito proxy is reused while its SHA-256 remains valid.
 
+The first validated set of four source values is atomically saved as `source-config` with mode `600` in that per-UID cache. When no source option is passed later, the launcher displays a valid saved configuration and offers to reuse it with `[Y/n]`; an empty answer or `y` reuses it, while `n` prompts for all four values. Passing any source option bypasses reuse, keeps the supplied values, prompts only for missing values, and atomically replaces the saved configuration after validation. The file must byte-match the canonical four-line serialization and is never sourced or evaluated. Symlinks, non-regular files, unexpected owners or modes, control characters, and malformed contents are rejected or ignored before use as appropriate. Cache reads and writes are locked, but interactive prompts never hold the lock.
+
 On the first run, the latest benchmark release is downloaded and recorded. Later runs keep using that verified cached version and only report when a newer release is available. Pass `--latest-update` to download, verify, and switch to the newest release. A damaged cache is restored from its recorded release before update handling, and a verified download is activated by an atomic metadata update. Cache operations hold an inter-process lock; the operating system releases this lock automatically if a launcher exits unexpectedly. Set `SOLANA_SHRED_TX_BENCHMARK_BIN` to an executable path to bypass benchmark release and cache handling with a specific local binary instead.
 
 ## Releases
@@ -73,7 +77,11 @@ A failed or cancelled release run also keeps its sequence number. To preserve a 
 
 ## Output
 
-The final table contains:
+When stdout is a terminal, a dedicated renderer updates one bounded in-place progress line every 200 ms with elapsed time and the cumulative unique transaction counts for `S1` and `S2`. The measurement loop only replaces a single latest-state slot, so slow terminal output cannot create a transaction backlog. Progress writes use a nonblocking terminal handle, and the renderer is always joined before the final stdout table, preventing delayed progress output from corrupting results. Redirected output stays static. The progress line is cleared before the final table, after Ctrl+C, or on an error.
+
+The final table sizes every column from its complete set of cells. Source names are shown with stable `S1`/`S2` aliases, limited to 32 characters, and non-ASCII or terminal-control characters are replaced with `?` so alignment and terminal state remain safe without locale-specific dependencies.
+
+The final aligned table contains:
 
 - `Unique tx`: distinct transactions decoded from that source.
 - `First`: matched transactions delivered first by that source.
@@ -89,7 +97,7 @@ Percentiles use nearest-rank: for `n` sorted lead times, percentile `p` selects 
 | `src/main.rs` | Connects to both proxy streams, decodes transaction signatures, aggregates results, and prints the table. |
 | `src/shredstream.rs` | Minimal generated gRPC client matching the Jito proxy protocol. |
 | `start_benchmark.sh` | Caches verified proxy and benchmark binaries, starts both streams, and cleans up runtime files. |
-| `tests/start_benchmark_cache.sh` | Exercises cache reuse, update, recovery, atomic failure, and override behavior. |
+| `tests/start_benchmark_cache.sh` | Exercises binary cache behavior plus safe source-configuration prompts, reuse, overrides, and recovery. |
 | `.github/workflows/release.yml` | Tests pull requests. |
 | `.github/workflows/publish-release.yml` | Tests updates to `main`, then publishes a tagged Linux x86_64 binary and checksum. |
 | `Cargo.toml` / `Cargo.lock` | Rust package definition and reproducible dependency lock. |
