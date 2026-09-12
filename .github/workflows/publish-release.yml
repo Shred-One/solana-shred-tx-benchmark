@@ -21,6 +21,8 @@ jobs:
         run: cargo fmt --check
       - name: Run tests
         run: cargo test --locked
+      - name: Test launcher cache
+        run: sh tests/start_benchmark_cache.sh
       - name: Build release binary
         run: cargo build --release --locked
       - name: Prepare release assets

@@ -14,6 +14,7 @@ source_2_name=""
 duration="60"
 grpc_port_1="19091"
 grpc_port_2="19092"
+latest_update=false
 
 usage() {
     cat <<'EOF'
@@ -27,6 +28,7 @@ Options:
   --duration SECONDS          Benchmark duration (default: 60)
   --grpc-port-1 PORT          First local proxy gRPC port (default: 19091)
   --grpc-port-2 PORT          Second local proxy gRPC port (default: 19092)
+  --latest-update             Download and use the latest benchmark release
   -h, --help                  Show this help
 EOF
 }
@@ -50,6 +52,10 @@ while [ "$#" -gt 0 ]; do
                 --grpc-port-1) grpc_port_1=$value ;;
                 --grpc-port-2) grpc_port_2=$value ;;
             esac
+            ;;
+        --latest-update)
+            latest_update=true
+            shift
             ;;
         -h | --help)
             usage
@@ -153,6 +159,9 @@ if [ -n "${SOLANA_SHRED_TX_BENCHMARK_BIN:-}" ] && [ ! -x "$SOLANA_SHRED_TX_BENCH
     exit 1
 fi
 
+cache_dir="${TMPDIR:-/tmp}/solana-shred-tx-benchmark-cache"
+mkdir -p "$cache_dir"
+chmod 700 "$cache_dir"
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/solana-shred-tx-benchmark.XXXXXX")
 proxy_pid_1=""
 proxy_pid_2=""
@@ -168,40 +177,141 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-proxy_bin="$work_dir/jito-shredstream-proxy"
-printf 'Downloading Jito ShredStream proxy %s...\n' "$PROXY_VERSION"
-curl -fsSL --retry 3 "$PROXY_URL" -o "$proxy_bin"
-printf '%s  %s\n' "$PROXY_SHA256" "$proxy_bin" | sha256sum -c -
+valid_release_tag() {
+    case "$1" in
+        0.1.*)
+            release_patch=${1#0.1.}
+            case "$release_patch" in
+                '' | *[!0-9]*) return 1 ;;
+            esac
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+resolve_latest_release() {
+    latest_release_url=$(curl -fsSL --retry 3 -o /dev/null -w '%{url_effective}' \
+        "$BENCHMARK_REPOSITORY_URL/releases/latest") || return 1
+    latest_release_url=${latest_release_url%/}
+    resolved_tag=${latest_release_url##*/}
+    if ! valid_release_tag "$resolved_tag"; then
+        printf 'Invalid latest release tag: %s\n' "$resolved_tag" >&2
+        return 1
+    fi
+    printf '%s\n' "$resolved_tag"
+}
+
+proxy_bin="$cache_dir/jito-shredstream-proxy-$PROXY_VERSION"
+if [ -f "$proxy_bin" ] &&
+    printf '%s  %s\n' "$PROXY_SHA256" "$proxy_bin" | sha256sum -c - >/dev/null 2>&1; then
+    printf 'Using cached Jito ShredStream proxy %s.\n' "$PROXY_VERSION"
+else
+    proxy_temp=$(mktemp "$cache_dir/.jito-shredstream-proxy.XXXXXX")
+    printf 'Downloading Jito ShredStream proxy %s...\n' "$PROXY_VERSION"
+    if ! curl -fsSL --retry 3 "$PROXY_URL" -o "$proxy_temp" ||
+        ! printf '%s  %s\n' "$PROXY_SHA256" "$proxy_temp" | sha256sum -c -; then
+        rm -f "$proxy_temp"
+        exit 1
+    fi
+    chmod +x "$proxy_temp"
+    mv -f "$proxy_temp" "$proxy_bin"
+fi
 chmod +x "$proxy_bin"
+
+metadata_file="$cache_dir/benchmark-version"
+benchmark_dir=""
+benchmark_bin=""
+checksum_file=""
+
+benchmark_cache_valid() {
+    [ -f "$benchmark_bin" ] && [ -f "$checksum_file" ] &&
+        (cd "$benchmark_dir" && sha256sum -c "$BENCHMARK_BINARY_NAME.sha256") >/dev/null 2>&1
+}
+
+download_benchmark() {
+    download_tag=$1
+    download_dir=$(mktemp -d "$cache_dir/benchmark.$download_tag.XXXXXX")
+    download_url="$BENCHMARK_REPOSITORY_URL/releases/download/$download_tag"
+    printf 'Downloading solana-shred-tx-benchmark %s...\n' "$download_tag"
+    if ! curl -fsSL --retry 3 "$download_url/$BENCHMARK_BINARY_NAME" \
+        -o "$download_dir/$BENCHMARK_BINARY_NAME" ||
+        ! curl -fsSL --retry 3 "$download_url/$BENCHMARK_BINARY_NAME.sha256" \
+            -o "$download_dir/$BENCHMARK_BINARY_NAME.sha256" ||
+        ! (cd "$download_dir" && sha256sum -c "$BENCHMARK_BINARY_NAME.sha256"); then
+        rm -rf "$download_dir"
+        return 1
+    fi
+    chmod +x "$download_dir/$BENCHMARK_BINARY_NAME"
+    metadata_temp=$(mktemp "$cache_dir/.benchmark-version.XXXXXX")
+    printf '%s %s\n' "$download_tag" "${download_dir##*/}" >"$metadata_temp"
+    mv -f "$metadata_temp" "$metadata_file"
+    benchmark_dir=$download_dir
+    benchmark_bin="$benchmark_dir/$BENCHMARK_BINARY_NAME"
+    checksum_file="$benchmark_bin.sha256"
+}
 
 if [ -n "${SOLANA_SHRED_TX_BENCHMARK_BIN:-}" ]; then
     benchmark_bin=$SOLANA_SHRED_TX_BENCHMARK_BIN
 else
-    benchmark_bin="$work_dir/$BENCHMARK_BINARY_NAME"
-    checksum_file="$benchmark_bin.sha256"
-    latest_release_url=$(curl -fsSL --retry 3 -o /dev/null -w '%{url_effective}' \
-        "$BENCHMARK_REPOSITORY_URL/releases/latest")
-    latest_release_url=${latest_release_url%/}
-    release_tag=${latest_release_url##*/}
-    release_patch=${release_tag#0.1.}
-    case "$release_tag" in
-        0.1.*) ;;
-        *)
-            printf 'Invalid latest release tag: %s\n' "$release_tag" >&2
+    cached_tag=""
+    if [ -r "$metadata_file" ]; then
+        cached_dir=""
+        extra=""
+        read -r cached_tag cached_dir extra <"$metadata_file" || true
+        if ! valid_release_tag "$cached_tag" || [ -n "$extra" ]; then
+            printf 'Ignoring invalid cached benchmark version: %s\n' "$cached_tag" >&2
+            cached_tag=""
+        else
+            case "$cached_dir" in
+                benchmark."$cached_tag".*)
+                    benchmark_dir="$cache_dir/$cached_dir"
+                    benchmark_bin="$benchmark_dir/$BENCHMARK_BINARY_NAME"
+                    checksum_file="$benchmark_bin.sha256"
+                    ;;
+                *)
+                    printf 'Ignoring invalid cached benchmark metadata.\n' >&2
+                    cached_tag=""
+                    ;;
+            esac
+        fi
+    fi
+
+    latest_tag=""
+    if [ -n "$cached_tag" ]; then
+        if benchmark_cache_valid; then
+            printf 'Using cached solana-shred-tx-benchmark %s.\n' "$cached_tag"
+        else
+            printf 'Restoring cached solana-shred-tx-benchmark %s...\n' "$cached_tag"
+            download_benchmark "$cached_tag"
+        fi
+    else
+        latest_tag=$(resolve_latest_release) || {
+            printf 'Unable to resolve the latest benchmark release.\n' >&2
             exit 1
-            ;;
-    esac
-    case "$release_patch" in
-        '' | *[!0-9]*)
-            printf 'Invalid latest release tag: %s\n' "$release_tag" >&2
-            exit 1
-            ;;
-    esac
-    benchmark_release_url="$BENCHMARK_REPOSITORY_URL/releases/download/$release_tag"
-    printf 'Downloading solana-shred-tx-benchmark %s...\n' "$release_tag"
-    curl -fsSL --retry 3 "$benchmark_release_url/$BENCHMARK_BINARY_NAME" -o "$benchmark_bin"
-    curl -fsSL --retry 3 "$benchmark_release_url/$BENCHMARK_BINARY_NAME.sha256" -o "$checksum_file"
-    (cd "$work_dir" && sha256sum -c "$BENCHMARK_BINARY_NAME.sha256")
+        }
+        download_benchmark "$latest_tag"
+        cached_tag=$latest_tag
+    fi
+
+    if [ -z "$latest_tag" ]; then
+        if ! latest_tag=$(resolve_latest_release); then
+            printf 'Unable to check for benchmark updates; using cached %s.\n' "$cached_tag" >&2
+            latest_tag=""
+        fi
+    fi
+    if [ -n "$latest_tag" ]; then
+        cached_patch=${cached_tag#0.1.}
+        latest_patch=${latest_tag#0.1.}
+        if [ "$latest_patch" -gt "$cached_patch" ]; then
+            if [ "$latest_update" = true ]; then
+                download_benchmark "$latest_tag"
+                cached_tag=$latest_tag
+            else
+                printf 'Benchmark update available: %s (cached: %s). Run with --latest-update to install it.\n' \
+                    "$latest_tag" "$cached_tag"
+            fi
+        fi
+    fi
     chmod +x "$benchmark_bin"
 fi
 
