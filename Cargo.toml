@@ -1,0 +1,19 @@
+[package]
+name = "solana-shred-tx-benchmark"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Compare Solana transaction arrival times from two shred sources"
+
+[dependencies]
+bincode = "1.3.3"
+prost = "0.13"
+serde = { version = "1", features = ["derive"] }
+solana-hash = { version = "=2.2.1", features = ["serde"] }
+solana-transaction = { version = "=2.2.1", features = ["serde"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tonic = { version = "0.13", default-features = false, features = ["channel", "codegen", "prost"] }
+
+[profile.release]
+lto = "thin"
+strip = true
