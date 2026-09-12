@@ -26,8 +26,10 @@ Each proxy independently reconstructs entries from its UDP stream. The benchmark
 ## Requirements
 
 - x86_64 Linux
-- `cargo`, `curl`, `git`, and `sha256sum`
+- `curl` and `sha256sum`
 - Two local IP/UDP ports where the upstream sources send shreds
+
+Building or running directly from source additionally requires Rust and Cargo.
 
 Development and verification are performed on Ubuntu 24.04. The launcher uses POSIX `sh` and common Linux utilities to remain portable across other Linux distributions.
 
@@ -57,7 +59,11 @@ From a local checkout:
 ./start_benchmark.sh
 ```
 
-Use `./start_benchmark.sh --help` for all options, including custom local gRPC ports. The launcher clones this repository into a temporary directory when it is not run from a checkout, builds the locked release binary, starts both proxies, and cleans up the processes and temporary files when the benchmark exits.
+Use `./start_benchmark.sh --help` for all options, including custom local gRPC ports. The launcher downloads the latest Linux x86_64 benchmark release and its SHA-256 file, verifies the binary, starts both proxies, and cleans up the processes and temporary files when the benchmark exits. Set `SOLANA_SHRED_TX_BENCHMARK_BIN` to an executable path to use a specific local benchmark binary instead.
+
+## Releases
+
+After each merge into `main`, CI tests the code, builds it for Linux x86_64, and publishes a GitHub Release. The first automated version is `0.1.0`; later releases increment the patch component (`0.1.1`, `0.1.2`, and so on). Each release contains the executable and its `.sha256` file. Rerunning a workflow for the same commit reuses that commit's existing tag.
 
 ## Output
 
@@ -74,8 +80,8 @@ The final table contains:
 |---|---|
 | `src/main.rs` | Connects to both proxy streams, decodes transaction signatures, aggregates results, and prints the table. |
 | `src/shredstream.rs` | Minimal generated gRPC client matching the Jito proxy protocol. |
-| `start_benchmark.sh` | Downloads and verifies the pinned proxy, builds the benchmark when needed, starts both streams, and cleans up. |
-| `.github/workflows/release.yml` | Tests pull requests and builds the release artifact after changes reach `main`. |
+| `start_benchmark.sh` | Downloads and verifies the pinned proxy and latest benchmark release, starts both streams, and cleans up. |
+| `.github/workflows/release.yml` | Tests pull requests and publishes a tagged release with the Linux x86_64 binary and checksum after changes reach `main`. |
 | `Cargo.toml` / `Cargo.lock` | Rust package definition and reproducible dependency lock. |
 
 ## Direct binary usage
