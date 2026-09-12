@@ -253,11 +253,59 @@ fi
 printf '%s\n' 127.0.0.1:22201 cli-one 127.0.0.1:22202 cli-two >"$test_dir/expected-config"
 cmp "$test_dir/expected-config" "$source_config"
 
-printf '%s\n' invalid corrupt 127.0.0.1:22002 second extra >"$source_config"
+printf '%s\n' 127.0.0.1:22301 first 127.0.0.1:22302 second extra >"$source_config"
 chmod 600 "$source_config"
-output=$(run_config_interactive '127.0.0.1:22301\nrepaired-one\n127.0.0.1:22302\nrepaired-two\n')
+output=$(run_config_interactive '127.0.0.1:22401\nrepaired-newline\n127.0.0.1:22402\nsecond\n')
 printf '%s\n' "$output" | grep -q 'Ignoring invalid saved source configuration.'
-grep -q '^repaired-one$' "$TEST_BENCHMARK_LOG"
+grep -q '^repaired-newline$' "$TEST_BENCHMARK_LOG"
+
+printf '%s\n' 127.0.0.1:22501 first 127.0.0.1:22502 second >"$source_config"
+printf 'extra' >>"$source_config"
+output=$(run_config_interactive '127.0.0.1:22601\nrepaired-eof\n127.0.0.1:22602\nsecond\n')
+printf '%s\n' "$output" | grep -q 'Ignoring invalid saved source configuration.'
+grep -q '^repaired-eof$' "$TEST_BENCHMARK_LOG"
+
+prompt_fifo="$test_dir/prompt-input"
+prompt_log="$test_dir/prompt.log"
+mkfifo "$prompt_fifo"
+exec 8<>"$prompt_fifo"
+PATH="$test_dir/bin:$PATH" TMPDIR="$config_tmp" \
+    SOLANA_SHRED_TX_BENCHMARK_BIN="$test_dir/bin/config-benchmark" \
+    script -qefc run-config-launcher /dev/null <"$prompt_fifo" >"$prompt_log" 2>&1 &
+prompt_pid=$!
+attempt=0
+until grep -q 'Use this configuration? \[Y/n\]' "$prompt_log"; do
+    if ! kill -0 "$prompt_pid" 2>/dev/null || [ "$attempt" -ge 40 ]; then
+        printf '\n' >&8 || true
+        exec 8>&-
+        wait "$prompt_pid" || true
+        echo 'Launcher did not wait at the saved configuration prompt' >&2
+        exit 1
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.05
+done
+TEST_TMPDIR="$config_tmp" SOLANA_SHRED_TX_BENCHMARK_BIN="$test_dir/bin/config-benchmark" \
+    run_launcher 0.1.3 >"$test_dir/concurrent.log" 2>&1 &
+concurrent_pid=$!
+attempt=0
+while kill -0 "$concurrent_pid" 2>/dev/null && [ "$attempt" -lt 80 ]; do
+    attempt=$((attempt + 1))
+    sleep 0.05
+done
+if kill -0 "$concurrent_pid" 2>/dev/null; then
+    kill "$concurrent_pid" 2>/dev/null || true
+    wait "$concurrent_pid" || true
+    printf '\n' >&8 || true
+    exec 8>&-
+    wait "$prompt_pid" || true
+    echo 'A launcher waiting at a prompt held the cache lock' >&2
+    exit 1
+fi
+wait "$concurrent_pid"
+printf '\n' >&8
+exec 8>&-
+wait "$prompt_pid"
 
 marker="$test_dir/config-was-sourced"
 printf '%s\n' 127.0.0.1:22401 "\$(touch $marker)" 127.0.0.1:22402 safe >"$source_config"

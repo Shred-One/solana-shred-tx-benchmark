@@ -200,7 +200,8 @@ read_source_config() {
         IFS= read -r saved_source_1_name || return 1
         IFS= read -r saved_source_2_address || return 1
         IFS= read -r saved_source_2_name || return 1
-        if IFS= read -r extra; then
+        extra=""
+        if IFS= read -r extra || [ -n "$extra" ]; then
             return 1
         fi
     } <"$config_file"
@@ -236,32 +237,38 @@ if [ -e "$config_file" ] || [ -L "$config_file" ]; then
     fi
 fi
 
-reuse_config=false
+saved_config_valid=false
 if [ "$source_option_supplied" = false ] && [ -f "$config_file" ]; then
     if read_source_config; then
-        printf 'Saved source configuration:\n'
-        printf '  First source UDP address: %s\n' "$saved_source_1_address"
-        printf '  First source name: %s\n' "$saved_source_1_name"
-        printf '  Second source UDP address: %s\n' "$saved_source_2_address"
-        printf '  Second source name: %s\n' "$saved_source_2_name"
-        while :; do
-            reuse_answer=$(prompt "Use this configuration? [Y/n]")
-            case "$reuse_answer" in
-                '' | y | Y | yes | YES | Yes)
-                    source_1_address=$saved_source_1_address
-                    source_1_name=$saved_source_1_name
-                    source_2_address=$saved_source_2_address
-                    source_2_name=$saved_source_2_name
-                    reuse_config=true
-                    break
-                    ;;
-                n | N | no | NO | No) break ;;
-                *) printf 'Please answer y or n.\n' >/dev/tty ;;
-            esac
-        done
+        saved_config_valid=true
     else
         printf 'Ignoring invalid saved source configuration.\n' >&2
     fi
+fi
+flock -u 9
+
+reuse_config=false
+if [ "$saved_config_valid" = true ]; then
+    printf 'Saved source configuration:\n'
+    printf '  First source UDP address: %s\n' "$saved_source_1_address"
+    printf '  First source name: %s\n' "$saved_source_1_name"
+    printf '  Second source UDP address: %s\n' "$saved_source_2_address"
+    printf '  Second source name: %s\n' "$saved_source_2_name"
+    while :; do
+        reuse_answer=$(prompt "Use this configuration? [Y/n]")
+        case "$reuse_answer" in
+            '' | y | Y | yes | YES | Yes)
+                source_1_address=$saved_source_1_address
+                source_1_name=$saved_source_1_name
+                source_2_address=$saved_source_2_address
+                source_2_name=$saved_source_2_name
+                reuse_config=true
+                break
+                ;;
+            n | N | no | NO | No) break ;;
+            *) printf 'Please answer y or n.\n' >/dev/tty ;;
+        esac
+    done
 fi
 
 if [ "$reuse_config" = false ]; then
@@ -288,10 +295,18 @@ if ! valid_source_name "$source_1_name" || ! valid_source_name "$source_2_name";
     exit 2
 fi
 if [ "$reuse_config" = false ]; then
+    flock -x 9
+    if [ -e "$config_file" ] || [ -L "$config_file" ]; then
+        if ! config_file_safe; then
+            printf 'Unsafe saved source configuration: %s\n' "$config_file" >&2
+            exit 1
+        fi
+    fi
     write_source_config || {
         printf 'Unable to save source configuration.\n' >&2
         exit 1
     }
+    flock -u 9
 fi
 
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/solana-shred-tx-benchmark.XXXXXX")
@@ -308,6 +323,8 @@ cleanup() {
     rm -rf "$work_dir"
 }
 trap cleanup EXIT INT TERM
+
+flock -x 9
 
 valid_release_tag() {
     case "$1" in

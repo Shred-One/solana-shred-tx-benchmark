@@ -7,7 +7,7 @@ use std::{
     fmt,
     future::Future,
     io::{self, IsTerminal, Write},
-    sync::{Arc, Condvar, Mutex},
+    sync::{mpsc as sync_mpsc, Arc, Condvar, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -39,6 +39,7 @@ Options:
 
 const START_DELAY: Duration = Duration::from_millis(10);
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
+const PROGRESS_FINISH_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_SOURCE_NAME_LEN: usize = 32;
 
 #[derive(Debug)]
@@ -176,7 +177,8 @@ struct RenderState {
 
 struct ProgressReporter {
     state: Option<Arc<(Mutex<RenderState>, Condvar)>>,
-    worker: Option<thread::JoinHandle<io::Result<()>>>,
+    worker: Option<thread::JoinHandle<()>>,
+    done: Option<sync_mpsc::Receiver<io::Result<()>>>,
 }
 
 impl ProgressReporter {
@@ -185,15 +187,20 @@ impl ProgressReporter {
             return Self {
                 state: None,
                 worker: None,
+                done: None,
             };
         }
 
         let state = Arc::new((Mutex::new(RenderState::default()), Condvar::new()));
         let worker_state = Arc::clone(&state);
-        let worker = thread::spawn(move || render_progress(output, worker_state));
+        let (done_sender, done) = sync_mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let _ = done_sender.send(render_progress(output, worker_state));
+        });
         Self {
             state: Some(state),
             worker: Some(worker),
+            done: Some(done),
         }
     }
 
@@ -222,11 +229,32 @@ impl ProgressReporter {
                 .finish = true;
             changed.notify_one();
         }
-        match self.worker.take() {
-            Some(worker) => worker
-                .join()
-                .map_err(|_| io::Error::other("progress renderer panicked"))?,
-            None => Ok(()),
+        let Some(done) = self.done.take() else {
+            return Ok(());
+        };
+        match done.recv_timeout(PROGRESS_FINISH_TIMEOUT) {
+            Ok(result) => {
+                self.worker
+                    .take()
+                    .expect("visible progress has a worker")
+                    .join()
+                    .map_err(|_| io::Error::other("progress renderer panicked"))?;
+                result
+            }
+            Err(sync_mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "progress renderer did not stop",
+            )),
+            Err(sync_mpsc::RecvTimeoutError::Disconnected) => {
+                self.worker
+                    .take()
+                    .expect("visible progress has a worker")
+                    .join()
+                    .map_err(|_| io::Error::other("progress renderer panicked"))?;
+                Err(io::Error::other(
+                    "progress renderer stopped without a result",
+                ))
+            }
         }
     }
 }
@@ -954,6 +982,34 @@ mod tests {
         assert!(!output.contains(&format_progress(Duration::from_secs(2), [2, 2])));
         assert!(output.contains(&format_progress(Duration::from_secs(3), [3, 3])));
         assert!(output.ends_with("\r\x1b[2K"));
+    }
+
+    #[test]
+    fn finish_times_out_when_progress_writer_remains_blocked() {
+        let output = SharedWriter::default();
+        let (started_sender, started_receiver) = std_mpsc::channel();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let progress = ProgressReporter::new(
+            true,
+            BlockingWriter {
+                output,
+                started: Some(started_sender),
+                gate: Arc::clone(&gate),
+            },
+        );
+        progress.report(Duration::from_secs(1), [1, 1]);
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+
+        let started = Instant::now();
+        let error = progress.finish().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        let (lock, changed) = &*gate;
+        *lock.lock().unwrap() = true;
+        changed.notify_one();
     }
 
     #[tokio::test]
