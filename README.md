@@ -63,7 +63,11 @@ Use `./start_benchmark.sh --help` for all options, including custom local gRPC p
 
 ## Releases
 
-After each update to `main`, a dedicated workflow tests the code, builds it for Linux x86_64 in a read-only job, and passes the binary and checksum to a minimal publishing job. Its stable workflow run number maps the first update to `0.1.0`, the second to `0.1.1`, and so on. The version is independent of merge strategy, commit count, and completion order; rerunning the same workflow run keeps the same version. Each release contains the executable and its `.sha256` file.
+After each update to `main`, a dedicated workflow tests the code, builds it for Linux x86_64 in a read-only job, and passes the binary and checksum to a minimal publishing job. Its stable workflow run number plus `RELEASE_VERSION_OFFSET` maps the first update to `0.1.0`, the second to `0.1.1`, and so on. The version is independent of merge strategy, commit count, and completion order; rerunning the same workflow run keeps the same version. The publishing job repairs missing or partial assets, publishes an interrupted draft, and verifies that the release is public before succeeding.
+
+`.github/workflows/publish-release.yml` is the persistent identity of the release sequence. Do not move, rename, delete, or recreate it. If an identity change is unavoidable, set `RELEASE_VERSION_OFFSET` in the replacement workflow to the next unused patch number before its first run; for example, use `13` when the latest release is `0.1.12`. Keep this workflow limited to `push` events on `main`, because every new workflow run consumes one sequence number.
+
+A failed or cancelled release run also keeps its sequence number. To preserve a continuous published series, rerun it and confirm that its release is public before the next update is merged into `main`. A later run advances to the next version and does not fill an earlier gap automatically.
 
 ## Output
 

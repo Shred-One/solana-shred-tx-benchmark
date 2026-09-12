@@ -7,6 +7,9 @@ on:
 permissions:
   contents: read
 
+env:
+  RELEASE_VERSION_OFFSET: 0
+
 jobs:
   build-release:
     runs-on: ubuntu-24.04
@@ -48,11 +51,13 @@ jobs:
       - name: Determine and reserve release version
         id: version
         run: |
-          case "$GITHUB_RUN_NUMBER" in
-            '' | *[!0-9]*) echo "Invalid workflow run number" >&2; exit 1 ;;
-          esac
+          for number in "$RELEASE_VERSION_OFFSET" "$GITHUB_RUN_NUMBER"; do
+            case "$number" in
+              '' | *[!0-9]*) echo "Invalid release sequence number" >&2; exit 1 ;;
+            esac
+          done
           [ "$GITHUB_RUN_NUMBER" -gt 0 ] || { echo "Invalid workflow run number" >&2; exit 1; }
-          tag="0.1.$((GITHUB_RUN_NUMBER - 1))"
+          tag="0.1.$((RELEASE_VERSION_OFFSET + GITHUB_RUN_NUMBER - 1))"
           git fetch --force --tags origin
           existing=$(git rev-list -n 1 "$tag" 2>/dev/null || true)
           if [ -n "$existing" ] && [ "$existing" != "$GITHUB_SHA" ]; then
@@ -74,10 +79,43 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
         run: |
-          tag=${{ steps.version.outputs.tag }}
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" dist/* --clobber
-          else
-            gh release create "$tag" dist/* --verify-tag --title "$tag" --generate-notes
+          state=missing
+          if is_draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft 2>/dev/null); then
+            case "$is_draft" in
+              true) state=draft ;;
+              false) state=published ;;
+              *) echo "Unable to determine release state" >&2; exit 1 ;;
+            esac
           fi
+          if [ "$state" = missing ]; then
+            gh release create "$RELEASE_TAG" --verify-tag --title "$RELEASE_TAG" --generate-notes --draft
+            state=draft
+          fi
+
+          gh release upload "$RELEASE_TAG" dist/* --clobber
+          asset_rows=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[] | [.name, .size] | @tsv')
+          for asset in \
+            solana-shred-tx-benchmark-x86_64-unknown-linux-gnu \
+            solana-shred-tx-benchmark-x86_64-unknown-linux-gnu.sha256
+          do
+            local_size=$(wc -c < "dist/$asset")
+            remote_size=$(printf '%s\n' "$asset_rows" | \
+              awk -F '\t' -v asset="$asset" '$1 == asset { print $2; found = 1 } END { exit !found }') || {
+                echo "Release asset is missing: $asset" >&2
+                exit 1
+              }
+            [ "$remote_size" = "$local_size" ] || {
+              echo "Release asset size does not match: $asset" >&2
+              exit 1
+            }
+          done
+
+          if [ "$state" = draft ]; then
+            gh release edit "$RELEASE_TAG" --draft=false
+          fi
+          [ "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = false ] || {
+            echo "Release is still a draft" >&2
+            exit 1
+          }
