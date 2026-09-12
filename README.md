@@ -26,8 +26,10 @@ Each proxy independently reconstructs entries from its UDP stream. The benchmark
 ## Requirements
 
 - x86_64 Linux
-- `cargo`, `curl`, `git`, and `sha256sum`
+- `curl` and `sha256sum`
 - Two local IP/UDP ports where the upstream sources send shreds
+
+Building or running directly from source additionally requires Rust and Cargo.
 
 Development and verification are performed on Ubuntu 24.04. The launcher uses POSIX `sh` and common Linux utilities to remain portable across other Linux distributions.
 
@@ -57,7 +59,15 @@ From a local checkout:
 ./start_benchmark.sh
 ```
 
-Use `./start_benchmark.sh --help` for all options, including custom local gRPC ports. The launcher clones this repository into a temporary directory when it is not run from a checkout, builds the locked release binary, starts both proxies, and cleans up the processes and temporary files when the benchmark exits.
+Use `./start_benchmark.sh --help` for all options, including custom local gRPC ports. The launcher resolves the latest release tag once, downloads the Linux x86_64 benchmark and its SHA-256 file from that same tag, verifies the binary, starts both proxies, and cleans up the processes and temporary files when the benchmark exits. Set `SOLANA_SHRED_TX_BENCHMARK_BIN` to an executable path to use a specific local benchmark binary instead.
+
+## Releases
+
+After each update to `main`, a dedicated workflow tests the code, builds it for Linux x86_64 in a read-only job, and passes the binary and checksum to a minimal publishing job. Its stable workflow run number plus `RELEASE_VERSION_OFFSET` maps the first update to `0.1.0`, the second to `0.1.1`, and so on. The version is independent of merge strategy, commit count, and completion order; rerunning the same workflow run keeps the same version. The publishing job repairs missing or partial assets, publishes an interrupted draft, and verifies that the release is public before succeeding.
+
+`.github/workflows/publish-release.yml` is the persistent identity of the release sequence. Do not move, rename, delete, or recreate it. If an identity change is unavoidable, set `RELEASE_VERSION_OFFSET` in the replacement workflow to the next unused patch number before its first run; for example, use `13` when the latest release is `0.1.12`. Keep this workflow limited to `push` events on `main`, because every new workflow run consumes one sequence number.
+
+A failed or cancelled release run also keeps its sequence number. To preserve a continuous published series, rerun it and confirm that its release is public before the next update is merged into `main`. A later run advances to the next version and does not fill an earlier gap automatically.
 
 ## Output
 
@@ -74,8 +84,9 @@ The final table contains:
 |---|---|
 | `src/main.rs` | Connects to both proxy streams, decodes transaction signatures, aggregates results, and prints the table. |
 | `src/shredstream.rs` | Minimal generated gRPC client matching the Jito proxy protocol. |
-| `start_benchmark.sh` | Downloads and verifies the pinned proxy, builds the benchmark when needed, starts both streams, and cleans up. |
-| `.github/workflows/release.yml` | Tests pull requests and builds the release artifact after changes reach `main`. |
+| `start_benchmark.sh` | Downloads and verifies the pinned proxy and latest benchmark release, starts both streams, and cleans up. |
+| `.github/workflows/release.yml` | Tests pull requests. |
+| `.github/workflows/publish-release.yml` | Tests updates to `main`, then publishes a tagged Linux x86_64 binary and checksum. |
 | `Cargo.toml` / `Cargo.lock` | Rust package definition and reproducible dependency lock. |
 
 ## Direct binary usage

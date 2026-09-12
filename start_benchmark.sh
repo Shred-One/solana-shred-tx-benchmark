@@ -4,7 +4,8 @@ set -eu
 PROXY_VERSION="v0.2.14"
 PROXY_SHA256="1b30b8e3fb4212b30774e9a277c19d42e1ff058d76f444d05afacd2e8f747a70"
 PROXY_URL="https://github.com/jito-labs/shredstream-proxy/releases/download/${PROXY_VERSION}/jito-shredstream-proxy-x86_64-unknown-linux-gnu"
-REPOSITORY_URL="https://github.com/Shred-One/solana-shred-tx-benchmark.git"
+BENCHMARK_BINARY_NAME="solana-shred-tx-benchmark-x86_64-unknown-linux-gnu"
+BENCHMARK_REPOSITORY_URL="https://github.com/Shred-One/solana-shred-tx-benchmark"
 
 source_1_address=""
 source_1_name=""
@@ -141,12 +142,16 @@ done
     printf 'The pinned ShredStream proxy binary supports x86_64 Linux only.\n' >&2
     exit 1
 }
-for command in cargo curl git sha256sum; do
+for command in curl sha256sum; do
     command -v "$command" >/dev/null 2>&1 || {
         printf 'Required command not found: %s\n' "$command" >&2
         exit 1
     }
 done
+if [ -n "${SOLANA_SHRED_TX_BENCHMARK_BIN:-}" ] && [ ! -x "$SOLANA_SHRED_TX_BENCHMARK_BIN" ]; then
+    printf 'Benchmark override is not executable: %s\n' "$SOLANA_SHRED_TX_BENCHMARK_BIN" >&2
+    exit 1
+fi
 
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/solana-shred-tx-benchmark.XXXXXX")
 proxy_pid_1=""
@@ -171,16 +176,33 @@ chmod +x "$proxy_bin"
 
 if [ -n "${SOLANA_SHRED_TX_BENCHMARK_BIN:-}" ]; then
     benchmark_bin=$SOLANA_SHRED_TX_BENCHMARK_BIN
-elif [ -f "./Cargo.toml" ] && grep -q 'name = "solana-shred-tx-benchmark"' ./Cargo.toml; then
-    repository_dir=$(pwd)
-    cargo build --release --locked --manifest-path "$repository_dir/Cargo.toml"
-    benchmark_bin="$repository_dir/target/release/solana-shred-tx-benchmark"
 else
-    repository_dir="$work_dir/repository"
-    printf 'Downloading solana-shred-tx-benchmark...\n'
-    git clone --depth 1 "$REPOSITORY_URL" "$repository_dir"
-    cargo build --release --locked --manifest-path "$repository_dir/Cargo.toml"
-    benchmark_bin="$repository_dir/target/release/solana-shred-tx-benchmark"
+    benchmark_bin="$work_dir/$BENCHMARK_BINARY_NAME"
+    checksum_file="$benchmark_bin.sha256"
+    latest_release_url=$(curl -fsSL --retry 3 -o /dev/null -w '%{url_effective}' \
+        "$BENCHMARK_REPOSITORY_URL/releases/latest")
+    latest_release_url=${latest_release_url%/}
+    release_tag=${latest_release_url##*/}
+    release_patch=${release_tag#0.1.}
+    case "$release_tag" in
+        0.1.*) ;;
+        *)
+            printf 'Invalid latest release tag: %s\n' "$release_tag" >&2
+            exit 1
+            ;;
+    esac
+    case "$release_patch" in
+        '' | *[!0-9]*)
+            printf 'Invalid latest release tag: %s\n' "$release_tag" >&2
+            exit 1
+            ;;
+    esac
+    benchmark_release_url="$BENCHMARK_REPOSITORY_URL/releases/download/$release_tag"
+    printf 'Downloading solana-shred-tx-benchmark %s...\n' "$release_tag"
+    curl -fsSL --retry 3 "$benchmark_release_url/$BENCHMARK_BINARY_NAME" -o "$benchmark_bin"
+    curl -fsSL --retry 3 "$benchmark_release_url/$BENCHMARK_BINARY_NAME.sha256" -o "$checksum_file"
+    (cd "$work_dir" && sha256sum -c "$BENCHMARK_BINARY_NAME.sha256")
+    chmod +x "$benchmark_bin"
 fi
 
 printf 'Starting proxy for %s on %s...\n' "$source_1_name" "$source_1_address"

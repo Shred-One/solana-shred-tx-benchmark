@@ -1,15 +1,12 @@
-name: Build release
+name: Test
 
-on:
-  pull_request:
-  push:
-    branches: [main]
+on: pull_request
 
 permissions:
   contents: read
 
 jobs:
-  build:
+  test:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -17,12 +14,3 @@ jobs:
         run: cargo fmt --check
       - name: Run tests
         run: cargo test --locked
-      - name: Build release binary
-        if: github.event_name == 'push'
-        run: cargo build --release --locked
-      - name: Upload release binary
-        if: github.event_name == 'push'
-        uses: actions/upload-artifact@v4
-        with:
-          name: solana-shred-tx-benchmark-${{ github.sha }}
-          path: target/release/solana-shred-tx-benchmark

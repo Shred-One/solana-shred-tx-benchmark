@@ -1,0 +1,121 @@
+name: Publish release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_VERSION_OFFSET: 0
+
+jobs:
+  build-release:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Run tests
+        run: cargo test --locked
+      - name: Build release binary
+        run: cargo build --release --locked
+      - name: Prepare release assets
+        run: |
+          mkdir dist
+          install -m 755 target/release/solana-shred-tx-benchmark \
+            dist/solana-shred-tx-benchmark-x86_64-unknown-linux-gnu
+          cd dist
+          sha256sum solana-shred-tx-benchmark-x86_64-unknown-linux-gnu \
+            > solana-shred-tx-benchmark-x86_64-unknown-linux-gnu.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build-release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist
+      - name: Determine and reserve release version
+        id: version
+        run: |
+          for number in "$RELEASE_VERSION_OFFSET" "$GITHUB_RUN_NUMBER"; do
+            case "$number" in
+              '' | *[!0-9]*) echo "Invalid release sequence number" >&2; exit 1 ;;
+            esac
+          done
+          [ "$GITHUB_RUN_NUMBER" -gt 0 ] || { echo "Invalid workflow run number" >&2; exit 1; }
+          tag="0.1.$((RELEASE_VERSION_OFFSET + GITHUB_RUN_NUMBER - 1))"
+          git fetch --force --tags origin
+          existing=$(git rev-list -n 1 "$tag" 2>/dev/null || true)
+          if [ -n "$existing" ] && [ "$existing" != "$GITHUB_SHA" ]; then
+            echo "$tag already points to another commit" >&2
+            exit 1
+          fi
+          if [ -z "$existing" ]; then
+            git tag "$tag" "$GITHUB_SHA"
+            if ! git push origin "refs/tags/$tag"; then
+              git tag -d "$tag"
+              git fetch --force --tags origin
+              [ "$(git rev-list -n 1 "$tag" 2>/dev/null || true)" = "$GITHUB_SHA" ] || {
+                echo "Unable to reserve $tag" >&2
+                exit 1
+              }
+            fi
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          state=missing
+          if is_draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft 2>/dev/null); then
+            case "$is_draft" in
+              true) state=draft ;;
+              false) state=published ;;
+              *) echo "Unable to determine release state" >&2; exit 1 ;;
+            esac
+          fi
+          if [ "$state" = missing ]; then
+            gh release create "$RELEASE_TAG" --verify-tag --title "$RELEASE_TAG" --generate-notes --draft
+            state=draft
+          fi
+
+          gh release upload "$RELEASE_TAG" dist/* --clobber
+          asset_rows=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[] | [.name, .size] | @tsv')
+          for asset in \
+            solana-shred-tx-benchmark-x86_64-unknown-linux-gnu \
+            solana-shred-tx-benchmark-x86_64-unknown-linux-gnu.sha256
+          do
+            local_size=$(wc -c < "dist/$asset")
+            remote_size=$(printf '%s\n' "$asset_rows" | \
+              awk -F '\t' -v asset="$asset" '$1 == asset { print $2; found = 1 } END { exit !found }') || {
+                echo "Release asset is missing: $asset" >&2
+                exit 1
+              }
+            [ "$remote_size" = "$local_size" ] || {
+              echo "Release asset size does not match: $asset" >&2
+              exit 1
+            }
+          done
+
+          if [ "$state" = draft ]; then
+            gh release edit "$RELEASE_TAG" --draft=false
+          fi
+          [ "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = false ] || {
+            echo "Release is still a draft" >&2
+            exit 1
+          }
