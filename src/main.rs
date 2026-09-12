@@ -362,7 +362,7 @@ fn render_table(rows: &[[String; 9]]) -> String {
     let mut lines = Vec::with_capacity(rows.len() + 1);
     for (row_index, row) in rows.iter().enumerate() {
         if row_index == 1 {
-            lines.push(widths.map(|width| "-".repeat(width)).join("  "));
+            lines.push(widths.map(|width| "-".repeat(width)).join("-+-"));
         }
         lines.push(
             row.iter()
@@ -376,7 +376,7 @@ fn render_table(rows: &[[String; 9]]) -> String {
                     }
                 })
                 .collect::<Vec<_>>()
-                .join("  "),
+                .join(" | "),
         );
     }
     lines.join("\n")
@@ -876,9 +876,22 @@ mod tests {
             ..Stats::default()
         };
         let table = stats.table(&names);
-        let widths = table.lines().map(str::len).collect::<Vec<_>>();
+        let lines = table.lines().collect::<Vec<_>>();
+        let widths = lines.iter().map(|line| line.len()).collect::<Vec<_>>();
+        let separators = lines
+            .iter()
+            .filter(|line| line.contains('|'))
+            .map(|line| {
+                line.match_indices('|')
+                    .map(|(index, _)| index)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
         assert!(widths.iter().all(|width| *width == widths[0]));
-        assert!(!table.contains('|'));
+        assert!(separators
+            .iter()
+            .all(|positions| *positions == separators[0]));
+        assert_eq!(separators[0].len(), 8);
         assert!(!table.contains('\x1b'));
         assert!(table.contains("60000.000 ms"));
         assert!(table.contains("S1 (one??[31m?)"));
