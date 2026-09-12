@@ -1,15 +1,9 @@
-name: Build release
+name: Test
 
-on:
-  pull_request:
-  push:
-    branches: [main]
+on: pull_request
 
 permissions:
   contents: read
-
-env:
-  RELEASE_BASE_SHA: 6d3af62b83f4d8bd206a4d682e0079332fd6c9d0
 
 jobs:
   test:
@@ -20,81 +14,3 @@ jobs:
         run: cargo fmt --check
       - name: Run tests
         run: cargo test --locked
-
-  build-release:
-    if: github.event_name == 'push'
-    needs: test
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build release binary
-        run: cargo build --release --locked
-      - name: Prepare release assets
-        run: |
-          mkdir dist
-          install -m 755 target/release/solana-shred-tx-benchmark \
-            dist/solana-shred-tx-benchmark-x86_64-unknown-linux-gnu
-          cd dist
-          sha256sum solana-shred-tx-benchmark-x86_64-unknown-linux-gnu \
-            > solana-shred-tx-benchmark-x86_64-unknown-linux-gnu.sha256
-      - uses: actions/upload-artifact@v4
-        with:
-          name: release-assets
-          path: dist/
-          if-no-files-found: error
-
-  publish:
-    if: github.event_name == 'push'
-    needs: build-release
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: actions/download-artifact@v4
-        with:
-          name: release-assets
-          path: dist
-      - name: Determine and reserve release version
-        id: version
-        run: |
-          git fetch --force --tags origin
-          git rev-list --first-parent "$GITHUB_SHA" | \
-            awk -v base="$RELEASE_BASE_SHA" '$0 == base { found = 1 } END { exit !found }' || {
-              echo "Release base is not on the first-parent history" >&2
-              exit 1
-            }
-          position=$(git rev-list --first-parent --count "$RELEASE_BASE_SHA..$GITHUB_SHA")
-          [ "$position" -gt 0 ] || { echo "No release commit after release base" >&2; exit 1; }
-          tag="0.1.$((position - 1))"
-          existing=$(git rev-list -n 1 "$tag" 2>/dev/null || true)
-          if [ -n "$existing" ] && [ "$existing" != "$GITHUB_SHA" ]; then
-            echo "$tag already points to another commit" >&2
-            exit 1
-          fi
-          if [ -z "$existing" ]; then
-            git tag "$tag" "$GITHUB_SHA"
-            if ! git push origin "refs/tags/$tag"; then
-              git tag -d "$tag"
-              git fetch --force --tags origin
-              [ "$(git rev-list -n 1 "$tag" 2>/dev/null || true)" = "$GITHUB_SHA" ] || {
-                echo "Unable to reserve $tag" >&2
-                exit 1
-              }
-            fi
-          fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-      - name: Create GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          tag=${{ steps.version.outputs.tag }}
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" dist/* --clobber
-          else
-            gh release create "$tag" dist/* --verify-tag --title "$tag" --generate-notes
-          fi

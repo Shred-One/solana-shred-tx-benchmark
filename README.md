@@ -63,7 +63,7 @@ Use `./start_benchmark.sh --help` for all options, including custom local gRPC p
 
 ## Releases
 
-After each merge into `main`, CI tests the code, builds it for Linux x86_64 in a read-only job, and passes the binary and checksum to a minimal publishing job. The fixed pre-release milestone is commit `6d3af62b83f4d8bd206a4d682e0079332fd6c9d0`; each later commit's position on the first-parent history maps deterministically to `0.1.0`, `0.1.1`, and so on. Release versions therefore remain in commit order even if workflow runs finish out of order. Each release contains the executable and its `.sha256` file, and rerunning a workflow for the same commit reuses that commit's tag.
+After each update to `main`, a dedicated workflow tests the code, builds it for Linux x86_64 in a read-only job, and passes the binary and checksum to a minimal publishing job. Its stable workflow run number maps the first update to `0.1.0`, the second to `0.1.1`, and so on. The version is independent of merge strategy, commit count, and completion order; rerunning the same workflow run keeps the same version. Each release contains the executable and its `.sha256` file.
 
 ## Output
 
@@ -81,7 +81,8 @@ The final table contains:
 | `src/main.rs` | Connects to both proxy streams, decodes transaction signatures, aggregates results, and prints the table. |
 | `src/shredstream.rs` | Minimal generated gRPC client matching the Jito proxy protocol. |
 | `start_benchmark.sh` | Downloads and verifies the pinned proxy and latest benchmark release, starts both streams, and cleans up. |
-| `.github/workflows/release.yml` | Tests pull requests and publishes a tagged release with the Linux x86_64 binary and checksum after changes reach `main`. |
+| `.github/workflows/release.yml` | Tests pull requests. |
+| `.github/workflows/publish-release.yml` | Tests updates to `main`, then publishes a tagged Linux x86_64 binary and checksum. |
 | `Cargo.toml` / `Cargo.lock` | Rust package definition and reproducible dependency lock. |
 
 ## Direct binary usage
