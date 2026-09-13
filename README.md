@@ -43,10 +43,16 @@ Pass all values when running non-interactively:
 curl -fsSL https://raw.githubusercontent.com/Shred-One/solana-shred-tx-benchmark/main/start_benchmark.sh | \
   sh -s -- \
     --source-1-address 0.0.0.0:11111 \
-    --source-1-name Source_A \
+    --source-1-name Shred.One \
     --source-2-address 0.0.0.0:11112 \
-    --source-2-name Shred.One \
+    --source-2-name Source_B \
     --duration 60
+```
+
+Download, verify, and activate the latest benchmark release before starting:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Shred-One/solana-shred-tx-benchmark/main/start_benchmark.sh | sh -s -- --latest-update
 ```
 
 Missing source addresses or names are prompted from `/dev/tty`, so the short interactive form also works:
